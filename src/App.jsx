@@ -1,345 +1,311 @@
-
-import { useState, useEffect, useCallback, useRef } from "react";
+/**
+ * Dealflow OS v3 — Main Application
+ * Fixed: CORS (all API via /api/claude proxy), Gmail MCP server-side,
+ *        file upload (PDF/DOCX/PPTX/XLS/IMG/TXT), assessment JSON parsing.
+ */
+import { useState, useCallback, useRef } from "react";
+import { callClaude, callClaudeJSON, loadGmailEmails, extractFileContent } from "./api.js";
 
 // ─── CONSTANTS ────────────────────────────────────────────────────────────────
-const PALETTE = ["#c6f135","#4d9cff","#ff5470","#f5b731","#32e8a0","#a78bfa","#ff9f43","#54a0ff"];
-const SECTORS = ["AI / Machine Learning","FinTech","HealthTech","CleanTech / Climate","Developer Tools","SaaS / Enterprise","DeepTech / Hardware","Consumer","Marketplace","Cybersecurity","BioTech","SpaceTech","Other"];
-const STAGES  = ["Pre-seed","Seed","Series A","Series B","Series C+"];
-const WEBMAILS = [
-  { id:"gmail",    label:"Gmail",           icon:"📧", color:"#ff5470", hint:"Google / Gmail MCP" },
-  { id:"roundcube",label:"Roundcube",       icon:"🟦", color:"#4d9cff", hint:"IMAP via Roundcube" },
-  { id:"ovh",      label:"OVH Mail",        icon:"🔵", color:"#a78bfa", hint:"OVHcloud webmail" },
-  { id:"outlook",  label:"Outlook / M365",  icon:"📘", color:"#5aabff", hint:"Microsoft 365" },
-  { id:"manual",   label:"Paste email",     icon:"📋", color:"#c6f135", hint:"Manual paste" },
+const SECTORS = [
+  "AI / Machine Learning","FinTech","HealthTech","CleanTech / Climate",
+  "Developer Tools","SaaS / Enterprise","DeepTech / Hardware","Consumer",
+  "Marketplace","Cybersecurity","BioTech","SpaceTech","Other",
 ];
+const STAGES  = ["Pre-seed","Seed","Series A","Series B","Series C+"];
+const PALETTE = ["#c6f135","#4d9cff","#ff5470","#f5b731","#32e8a0","#a78bfa","#ff9f43","#54a0ff"];
+const WEBMAILS = [
+  { id:"gmail",     label:"Gmail",        icon:"📧", color:"#ff5470" },
+  { id:"roundcube", label:"Roundcube",    icon:"🟦", color:"#4d9cff" },
+  { id:"ovh",       label:"OVH Mail",     icon:"🔵", color:"#a78bfa" },
+  { id:"paste",     label:"Coller email", icon:"📋", color:"#c6f135" },
+];
+const FILE_ACCEPT = ".pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.txt,.csv,.md,.jpg,.jpeg,.png,.webp,.gif,.eml";
 
-// ─── HELPERS ─────────────────────────────────────────────────────────────────
-function uid()   { return Date.now().toString(36) + Math.random().toString(36).slice(2,6); }
-function hue(n)  { let h=0; for(const c of (n||"X")) h=(h*31+c.charCodeAt(0))&0xffff; return PALETTE[h%PALETTE.length]; }
-function ini(n)  { return (n||"?").split(" ").slice(0,2).map(w=>w[0]).join("").toUpperCase(); }
-function scoreCol(v){ return v>=8?"#32e8a0":v>=6?"#c6f135":v>=4?"#f5b731":"#ff5470"; }
+// ─── HELPERS ──────────────────────────────────────────────────────────────────
+const uid     = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+const hue     = (n) => { let h = 0; for (const c of (n||"X")) h = (h*31+c.charCodeAt(0)) & 0xffff; return PALETTE[h % PALETTE.length]; };
+const ini     = (n) => (n||"?").split(" ").slice(0,2).map(w=>w[0]).join("").toUpperCase();
+const scCol   = (v) => v>=8?"#32e8a0":v>=6?"#c6f135":v>=4?"#f5b731":"#ff5470";
+const persist = (c) => { try { localStorage.setItem("dfos3", JSON.stringify(c)); } catch {} };
+const restore = ()  => { try { const d=localStorage.getItem("dfos3"); return d?JSON.parse(d):[]; } catch { return []; } };
+const fileExt = (n) => n.split(".").pop().toLowerCase();
+const fileIcon= (n) => {
+  const e = fileExt(n);
+  return e==="pdf"?"📕":["ppt","pptx"].includes(e)?"📊":["doc","docx"].includes(e)?"📝":
+         ["xls","xlsx","csv"].includes(e)?"📈":["jpg","jpeg","png","gif","webp"].includes(e)?"🖼️":"📎";
+};
 
-// ─── API CALL WITH NO-TRAINING HEADER ────────────────────────────────────────
-async function callClaude(prompt, system, opts={}) {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      // Opt out of training use for all submitted data
-      "anthropic-beta": "no-training-2024-05-01",
-    },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: opts.maxTokens || 1000,
-      system: system || "You are a senior VC analyst. Be concise and insightful.",
-      messages: [{ role: "user", content: prompt }],
-      ...(opts.mcpServers ? { mcp_servers: opts.mcpServers } : {}),
-      ...(opts.tools      ? { tools: opts.tools }             : {}),
-    }),
-  });
-  const d = await res.json();
-  return d.content?.filter(b=>b.type==="text").map(b=>b.text).join("") || "";
-}
-
-async function callClaudeJSON(prompt, system) {
-  const raw = await callClaude(prompt, system + "\nReturn ONLY valid JSON, no markdown fences.");
-  try { return JSON.parse(raw.replace(/```json|```/g,"").trim()); }
-  catch { return null; }
-}
-
-// ─── STORAGE ──────────────────────────────────────────────────────────────────
-function save(companies) {
-  try { localStorage.setItem("dfos3", JSON.stringify(companies)); } catch {}
-}
-function loadSaved() {
-  try { const d = localStorage.getItem("dfos3"); return d ? JSON.parse(d) : []; } catch { return []; }
-}
-
-// ─── WORD EXPORT (downloads JSON for backend, or generates via Blob for demo) ─
-function exportWordBlob(company) {
-  // Build a rich-text RTF-like plain download as .txt fallback shown alongside instructions
-  const lines = [
-    "DEALFLOW OS — INVESTMENT MEMO",
-    "================================",
-    `Company: ${company.name}`,
-    `Sector: ${company.sector} | Stage: ${company.stage} | Location: ${company.location||"—"}`,
-    `Status: ${company.status?.toUpperCase()}`,
-    `Date: ${new Date().toLocaleDateString("fr-FR")}`,
-    "",
-    "NOTE: This document was generated by Dealflow OS.",
-    "Data must not be used for AI model training or shared with unauthorised parties.",
-    "",
-    "─── EXECUTIVE SUMMARY ───",
-    company.assessment?.summary || company.description || "",
-    "",
-    ...(company.scores?.overall ? [
-      "─── SCORES ───",
-      `Overall: ${company.scores.overall}/10  |  Team: ${company.scores.team}/10  |  Market: ${company.scores.market}/10  |  Product: ${company.scores.product}/10`,
-      "",
-    ] : []),
-    ...(company.assessment?.keyMetrics ? [
-      "─── KEY METRICS ───",
-      ...Object.entries(company.assessment.keyMetrics).map(([k,v])=>`${k}: ${v}`),
-      "",
-    ] : []),
-    ...(company.assessment?.strengths?.length ? [
-      "─── STRENGTHS ───",
-      ...company.assessment.strengths.map(s=>"• "+s),
-      "",
-    ] : []),
-    ...(company.assessment?.risks?.length ? [
-      "─── KEY RISKS ───",
-      ...company.assessment.risks.map(r=>"• "+r),
-      "",
-    ] : []),
-    ...(company.report ? [
-      "─── INVESTMENT MEMO ───",
-      company.report,
-      "",
-    ] : []),
-    ...(company.news?.length ? [
-      "─── RECENT NEWS ───",
-      ...company.news.map(n=>`${n.date}  ${n.title}`),
-      "",
-    ] : []),
-    ...(company.notes?.length ? [
-      "─── ANALYST NOTES ───",
-      ...company.notes.map(n=>`[${new Date(n.date).toLocaleDateString("fr-FR")}] ${n.text}`),
-      "",
-    ] : []),
-    "─── SOURCE ───",
-    company.sourceEmail ? `From: ${company.sourceEmail.from} <${company.sourceEmail.fromEmail}> (${company.sourceEmail.role})` : "Manual entry",
-    "",
-    "CONFIDENTIAL — For internal VC use only. Not for AI training.",
-  ];
-  const content = lines.join("\n");
-  const blob = new Blob([content], { type: "application/msword" });
-  const url  = URL.createObjectURL(blob);
-  const a    = document.createElement("a");
-  a.href     = url;
-  a.download = `${company.name.replace(/\s+/g,"_")}_Memo.doc`;
-  a.click();
-  URL.revokeObjectURL(url);
-}
-
-// ─── STYLES ──────────────────────────────────────────────────────────────────
+// ─── DESIGN TOKENS ───────────────────────────────────────────────────────────
 const G = {
   ink:"#0d0e14", ink2:"#1a1c27", ink3:"#252736", ink4:"#313449", ink5:"#3e4159",
   mist:"#8b8fa8", fog:"#c4c6d4", paper:"#f0eff8",
   lime:"#c6f135", sky:"#4d9cff", rose:"#ff5470", gold:"#f5b731", mint:"#32e8a0", lav:"#a78bfa",
 };
-const css = {
-  app:    { display:"flex", height:"100vh", overflow:"hidden", background:G.ink, color:G.paper, fontFamily:"system-ui,-apple-system,sans-serif" },
-  side:   { width:220, minWidth:220, background:G.ink2, borderRight:`1px solid ${G.ink4}`, display:"flex", flexDirection:"column", overflow:"hidden" },
-  main:   { flex:1, display:"flex", flexDirection:"column", overflow:"hidden" },
-  topbar: { height:52, minHeight:52, background:G.ink2, borderBottom:`1px solid ${G.ink4}`, display:"flex", alignItems:"center", padding:"0 20px", gap:12 },
-  scroll: { flex:1, overflowY:"auto", padding:20 },
-};
 
-// ─── SMALL COMPONENTS ─────────────────────────────────────────────────────────
-function Btn({ children, onClick, accent, ghost, sm, style={} }) {
-  const base = {
+// ─── SMALL UI COMPONENTS ──────────────────────────────────────────────────────
+const Btn = ({ children, onClick, accent, ghost, danger, sm, style={}, disabled=false }) => (
+  <button disabled={disabled} onClick={onClick} style={{
     display:"inline-flex", alignItems:"center", gap:6,
-    padding: sm ? "5px 10px" : "7px 14px",
-    borderRadius:8, fontSize: sm ? 11 : 12, fontWeight:600, cursor:"pointer",
-    border:`1px solid ${G.ink4}`, background: accent ? G.lime : ghost ? "transparent" : G.ink3,
-    color: accent ? G.ink : ghost ? G.mist : G.fog, fontFamily:"inherit",
-    transition:"all .15s", ...style,
-  };
-  return <button style={base} onClick={onClick}>{children}</button>;
-}
+    padding: sm?"5px 10px":"7px 14px",
+    borderRadius:8, fontSize:sm?11:12, fontWeight:600, cursor:disabled?"not-allowed":"pointer",
+    border:`1px solid ${accent?G.lime:ghost?"transparent":danger?G.rose:G.ink4}`,
+    background: accent?G.lime:ghost?"transparent":danger?`${G.rose}18`:G.ink3,
+    color: accent?G.ink:ghost?G.mist:danger?G.rose:G.fog,
+    opacity: disabled?0.5:1, fontFamily:"inherit", transition:"all .15s", ...style,
+  }}>{children}</button>
+);
 
-function Tag({ text, color }) {
-  return (
-    <span style={{ fontSize:9, padding:"2px 7px", borderRadius:20, fontFamily:"monospace",
-      fontWeight:600, background:`${color}14`, border:`1px solid ${color}33`, color }}>
-      {text}
-    </span>
-  );
-}
+const Tag = ({ text, color }) => (
+  <span style={{ fontSize:9, padding:"2px 7px", borderRadius:20, fontFamily:"monospace",
+    fontWeight:600, background:`${color}14`, border:`1px solid ${color}33`, color }}>
+    {text}
+  </span>
+);
 
-function ScoreBar({ value, size=2 }) {
-  return (
-    <div style={{ height:size, background:G.ink4, borderRadius:1, overflow:"hidden" }}>
-      <div style={{ height:"100%", width:`${(value||0)*10}%`, background:scoreCol(value||0), borderRadius:1, transition:"width .6s" }} />
-    </div>
-  );
-}
-
-function Avatar({ name, size=34 }) {
+const Avatar = ({ name, size=34 }) => {
   const col = hue(name);
   return (
-    <div style={{ width:size, height:size, borderRadius:Math.round(size*0.27), flexShrink:0,
+    <div style={{ width:size, height:size, borderRadius:Math.round(size*.27), flexShrink:0,
       display:"flex", alignItems:"center", justifyContent:"center",
-      background:`${col}18`, color:col, fontSize:size*0.38, fontWeight:800, border:`1px solid ${col}33` }}>
+      background:`${col}18`, color:col, fontSize:size*.38, fontWeight:800 }}>
       {ini(name)}
     </div>
   );
-}
+};
 
-function SectionLabel({ children }) {
-  return (
-    <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:8 }}>
-      <span style={{ fontSize:9, fontFamily:"monospace", textTransform:"uppercase", letterSpacing:"1.2px", color:G.mist }}>{children}</span>
-      <div style={{ flex:1, height:1, background:G.ink4 }} />
-    </div>
-  );
-}
+const Dots = () => (
+  <span style={{ display:"inline-flex", gap:4 }}>
+    {[0,.2,.4].map((d,i)=>(
+      <span key={i} style={{ width:5, height:5, borderRadius:"50%", background:G.lime,
+        display:"inline-block", animation:`blink 1.2s ${d}s infinite` }} />
+    ))}
+  </span>
+);
 
-function Spinner() {
-  return <span style={{ display:"inline-block", width:14, height:14, borderRadius:"50%", border:`2px solid ${G.ink4}`, borderTopColor:G.lime, animation:"spin .7s linear infinite" }} />;
-}
+const Spin = () => (
+  <span style={{ display:"inline-block", width:14, height:14, borderRadius:"50%",
+    border:`2px solid ${G.ink4}`, borderTopColor:G.lime, animation:"spin .7s linear infinite", flexShrink:0 }} />
+);
 
-function Dots() {
-  return (
-    <span style={{ display:"inline-flex", gap:4 }}>
-      {[0,.2,.4].map((d,i)=>(
-        <span key={i} style={{ width:5, height:5, borderRadius:"50%", background:G.lime, animation:`blink 1.2s ${d}s infinite` }} />
-      ))}
-    </span>
-  );
-}
+const ScoreBar = ({ value, h=2 }) => (
+  <div style={{ height:h, background:G.ink4, borderRadius:1, overflow:"hidden", marginTop:6 }}>
+    <div style={{ height:"100%", width:`${(value||0)*10}%`, background:scCol(value||0), borderRadius:1, transition:"width .6s" }} />
+  </div>
+);
 
-function Toast({ msg, visible }) {
-  return (
-    <div style={{ position:"fixed", bottom:24, left:"50%", transform:`translateX(-50%) translateY(${visible?0:80}px)`,
-      background:G.ink3, border:`1px solid ${G.ink4}`, borderRadius:8, padding:"10px 18px",
-      fontSize:12, fontWeight:600, zIndex:300, transition:"transform .3s", display:"flex", alignItems:"center", gap:8 }}>
-      ✓ {msg}
-    </div>
-  );
-}
+const SecLabel = ({ children }) => (
+  <div style={{ display:"flex", alignItems:"center", gap:8, margin:"16px 0 8px" }}>
+    <span style={{ fontSize:9, fontFamily:"monospace", textTransform:"uppercase", letterSpacing:"1.2px", color:G.mist, whiteSpace:"nowrap" }}>{children}</span>
+    <div style={{ flex:1, height:1, background:G.ink4 }} />
+  </div>
+);
 
-// ─── NAV ITEM ─────────────────────────────────────────────────────────────────
-function NavItem({ icon, label, badge, active, onClick }) {
-  return (
-    <button onClick={onClick} style={{
-      display:"flex", alignItems:"center", gap:9, padding:"7px 12px", borderRadius:7,
-      cursor:"pointer", fontSize:12, color: active ? G.lime : G.mist,
-      background: active ? G.ink3 : "transparent", border:"none", width:"100%", textAlign:"left",
-      fontFamily:"inherit", fontWeight: active ? 600 : 400, transition:"all .15s",
-    }}>
-      <span style={{ fontSize:15, width:16, textAlign:"center" }}>{icon}</span>
-      <span style={{ flex:1 }}>{label}</span>
-      {badge != null && (
-        <span style={{ fontSize:10, background:G.ink4, color:G.mist, padding:"1px 7px", borderRadius:10, fontFamily:"monospace" }}>
-          {badge}
-        </span>
+const Input = ({ label, value, onChange, type="text", placeholder="", style={} }) => (
+  <div style={style}>
+    {label && <label style={{ fontSize:9, fontFamily:"monospace", textTransform:"uppercase", letterSpacing:".8px", color:G.mist, marginBottom:5, display:"block" }}>{label}</label>}
+    <input type={type} value={value||""} onChange={e=>onChange(e.target.value)} placeholder={placeholder}
+      style={{ background:G.ink3, border:`1px solid ${G.ink4}`, borderRadius:8, color:G.paper,
+        fontSize:12, padding:"8px 12px", width:"100%", fontFamily:"inherit", outline:"none" }} />
+  </div>
+);
+
+const Select = ({ label, value, onChange, options, style={} }) => (
+  <div style={style}>
+    {label && <label style={{ fontSize:9, fontFamily:"monospace", textTransform:"uppercase", letterSpacing:".8px", color:G.mist, marginBottom:5, display:"block" }}>{label}</label>}
+    <select value={value||""} onChange={e=>onChange(e.target.value)}
+      style={{ background:G.ink3, border:`1px solid ${G.ink4}`, borderRadius:8, color:G.paper,
+        fontSize:12, padding:"8px 12px", width:"100%", fontFamily:"inherit", outline:"none" }}>
+      {options.map(o => typeof o==="string"
+        ? <option key={o} value={o}>{o}</option>
+        : <option key={o.value} value={o.value}>{o.label}</option>
       )}
-    </button>
+    </select>
+  </div>
+);
+
+const Toast = ({ msg, visible }) => (
+  <div style={{ position:"fixed", bottom:24, left:"50%",
+    transform:`translateX(-50%) translateY(${visible?0:90}px)`,
+    background:G.ink3, border:`1px solid ${G.ink4}`, borderRadius:8,
+    padding:"10px 18px", fontSize:12, fontWeight:600, zIndex:500,
+    transition:"transform .3s", display:"flex", alignItems:"center", gap:8 }}>
+    ✓ {msg}
+  </div>
+);
+
+const NavItem = ({ icon, label, badge, active, onClick }) => (
+  <button onClick={onClick} style={{
+    display:"flex", alignItems:"center", gap:9, padding:"7px 12px", borderRadius:7,
+    cursor:"pointer", fontSize:12, color:active?G.lime:G.mist,
+    background:active?G.ink3:"transparent", border:"none",
+    width:"100%", textAlign:"left", fontFamily:"inherit", fontWeight:active?600:400,
+  }}>
+    <span style={{ fontSize:15, width:16, textAlign:"center", flexShrink:0 }}>{icon}</span>
+    <span style={{ flex:1 }}>{label}</span>
+    {badge != null && (
+      <span style={{ fontSize:10, background:G.ink4, color:G.mist, padding:"1px 7px", borderRadius:10, fontFamily:"monospace" }}>
+        {badge}
+      </span>
+    )}
+  </button>
+);
+
+// ─── FILE UPLOAD DROP ZONE ────────────────────────────────────────────────────
+function DropZone({ onFiles, multiple=true, compact=false }) {
+  const [drag, setDrag] = useState(false);
+  const ref = useRef();
+
+  const handle = async (files) => {
+    if (files?.length) onFiles([...files]);
+  };
+
+  return (
+    <div
+      onDragOver={e=>{ e.preventDefault(); setDrag(true); }}
+      onDragLeave={()=>setDrag(false)}
+      onDrop={e=>{ e.preventDefault(); setDrag(false); handle(e.dataTransfer.files); }}
+      onClick={()=>ref.current.click()}
+      style={{
+        border:`1.5px dashed ${drag?G.lime:G.ink5}`, borderRadius:10,
+        padding: compact?"12px":"28px", textAlign:"center", cursor:"pointer",
+        background: drag?`${G.lime}06`:G.ink2, transition:"all .2s",
+      }}>
+      <input ref={ref} type="file" multiple={multiple} accept={FILE_ACCEPT}
+        style={{ display:"none" }} onChange={e=>handle(e.target.files)} />
+      <div style={{ fontSize: compact?18:28, marginBottom: compact?4:8 }}>📁</div>
+      <div style={{ fontSize: compact?11:13, color:G.fog, fontWeight:600, marginBottom:4 }}>
+        {compact?"Ajouter des fichiers":"Déposer des fichiers ici"}
+      </div>
+      <div style={{ fontSize:10, color:G.mist }}>
+        PDF, Word, PowerPoint, Excel, Images, TXT, CSV
+      </div>
+    </div>
   );
 }
 
-// ─── COMPANY CARD (Kanban) ─────────────────────────────────────────────────────
+// ─── COMPANY CARD (kanban) ────────────────────────────────────────────────────
 function CompanyCard({ company, onClick }) {
-  const sc = company.scores?.overall || 0;
+  const col = hue(company.name);
+  const sc  = company.scores?.overall || 0;
   const rec = company.assessment?.recommendation;
-  const recColor = rec==="Invest" ? G.mint : rec==="Watch" ? G.gold : G.mist;
+  const recCol = rec==="Invest"?G.mint:rec==="Watch"?G.gold:G.mist;
   return (
     <div onClick={onClick} style={{
-      background:G.ink3, border:`1px solid ${G.ink4}`, borderRadius:10, padding:12,
-      cursor:"pointer", transition:"all .2s", marginBottom:8,
+      background:G.ink3, border:`1px solid ${G.ink4}`, borderRadius:10,
+      padding:12, cursor:"pointer", marginBottom:8, transition:"all .18s",
     }}
     onMouseOver={e=>{ e.currentTarget.style.borderColor=G.ink5; e.currentTarget.style.transform="translateY(-1px)"; }}
-    onMouseOut={e=>{ e.currentTarget.style.borderColor=G.ink4; e.currentTarget.style.transform="none"; }}>
-      <div style={{ display:"flex", gap:9, marginBottom:8 }}>
+    onMouseOut={e=> { e.currentTarget.style.borderColor=G.ink4; e.currentTarget.style.transform="none"; }}>
+      <div style={{ display:"flex", gap:9, marginBottom:7 }}>
         <Avatar name={company.name} size={32} />
         <div style={{ flex:1, minWidth:0 }}>
-          <div style={{ fontSize:12, fontWeight:700, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{company.name}</div>
+          <div style={{ fontSize:12, fontWeight:700, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{company.name}</div>
           <div style={{ fontSize:9, color:G.mist, fontFamily:"monospace" }}>{company.sector} · {company.stage}</div>
         </div>
-        {sc > 0 && <div style={{ fontSize:17, fontWeight:800, color:scoreCol(sc), lineHeight:1 }}>{sc}</div>}
+        {sc>0 && <div style={{ fontSize:17, fontWeight:800, color:scCol(sc), lineHeight:1 }}>{sc}</div>}
       </div>
       {company.assessment?.summary
-        ? <div style={{ fontSize:11, color:G.fog, lineHeight:1.55, marginBottom:8, display:"-webkit-box", WebkitLineClamp:2, WebkitBoxOrient:"vertical", overflow:"hidden" }}>{company.assessment.summary}</div>
-        : <div style={{ fontSize:11, color:G.mist, fontStyle:"italic", marginBottom:8 }}>Analysing…</div>}
+        ? <div style={{ fontSize:11, color:G.fog, lineHeight:1.55, marginBottom:7,
+            display:"-webkit-box", WebkitLineClamp:2, WebkitBoxOrient:"vertical", overflow:"hidden" }}>
+            {company.assessment.summary}
+          </div>
+        : <div style={{ fontSize:11, color:G.mist, fontStyle:"italic", marginBottom:7 }}>En cours d'analyse…</div>
+      }
       <div style={{ display:"flex", flexWrap:"wrap", gap:4 }}>
-        {(company.tags||[]).slice(0,3).map((t,i)=><Tag key={i} text={t} color={hue(company.name)} />)}
-        {rec && <Tag text={rec} color={recColor} />}
-        {company.source==="email" && <Tag text="📧 email" color={G.sky} />}
+        {(company.tags||[]).slice(0,3).map((t,i)=><Tag key={i} text={t} color={col} />)}
+        {rec && <Tag text={rec} color={recCol} />}
+        {company.source==="email" && <Tag text="📧" color={G.sky} />}
       </div>
-      {sc > 0 && <ScoreBar value={sc} size={2} />}
+      {sc>0 && <ScoreBar value={sc} />}
     </div>
   );
 }
 
 // ─── DETAIL PANEL ─────────────────────────────────────────────────────────────
-function DetailPanel({ company, onClose, onStatusChange, onRefresh, onExport, onNote }) {
-  const [noteText, setNoteText] = useState("");
+function DetailPanel({ company, onClose, onChange, onAction }) {
+  const [note, setNote] = useState("");
   if (!company) return null;
-  const a = company.assessment || {};
-  const sc = company.scores || {};
+  const a  = company.assessment || {};
+  const sc = company.scores     || {};
+  const col = hue(company.name);
 
   const StatusBtn = ({ s, label, color }) => (
-    <button onClick={() => onStatusChange(s)} style={{
-      flex:1, padding:"6px 4px", borderRadius:7, border:`1px solid ${company.status===s ? color : G.ink4}`,
-      background: company.status===s ? `${color}18` : G.ink4, color: company.status===s ? color : G.mist,
-      fontSize:10, fontFamily:"monospace", fontWeight:600, cursor:"pointer", textTransform:"uppercase", letterSpacing:".5px",
+    <button onClick={()=>onChange({ status:s })} style={{
+      flex:1, padding:"6px 4px", borderRadius:7, cursor:"pointer",
+      border:`1px solid ${company.status===s?color:G.ink4}`,
+      background:company.status===s?`${color}18`:G.ink4,
+      color:company.status===s?color:G.mist,
+      fontSize:10, fontFamily:"monospace", fontWeight:600, textTransform:"uppercase",
     }}>{label}</button>
   );
 
   return (
-    <div style={{ position:"fixed", top:0, right:0, width:480, height:"100vh", background:G.ink2,
-      borderLeft:`1px solid ${G.ink4}`, zIndex:100, overflowY:"auto", display:"flex", flexDirection:"column" }}>
+    <div style={{ position:"fixed", top:0, right:0, width:480, height:"100vh",
+      background:G.ink2, borderLeft:`1px solid ${G.ink4}`, zIndex:200,
+      overflowY:"auto", display:"flex", flexDirection:"column" }}>
       {/* Hero */}
-      <div style={{ padding:"18px 20px 14px", borderBottom:`1px solid ${G.ink4}`, background:G.ink3, position:"relative" }}>
+      <div style={{ padding:"18px 20px 14px", borderBottom:`1px solid ${G.ink4}`, background:G.ink3, position:"relative", flexShrink:0 }}>
         <div style={{ display:"flex", gap:12, marginBottom:12 }}>
           <Avatar name={company.name} size={44} />
           <div style={{ flex:1 }}>
             <div style={{ fontSize:17, fontWeight:800, marginBottom:3 }}>{company.name}</div>
             <div style={{ fontSize:11, color:G.mist, fontFamily:"monospace" }}>
-              {company.sector} · {company.stage}{company.location ? ` · ${company.location}` : ""}
+              {company.sector} · {company.stage}{company.location?` · ${company.location}`:""}
             </div>
             {company.sourceEmail && (
               <div style={{ fontSize:10, color:G.mist, marginTop:3 }}>
-                📧 {company.sourceEmail.from} ({company.sourceEmail.role}) · {company.sourceEmail.provider||"email"}
+                📧 {company.sourceEmail.from} · <span style={{ color: company.sourceEmail.role==="founder"?G.lime:company.sourceEmail.role==="investor"?G.sky:G.lav }}>{company.sourceEmail.role}</span>
               </div>
             )}
           </div>
         </div>
         <div style={{ display:"flex", gap:5 }}>
-          <StatusBtn s="dealflow" label="Dealflow" color={G.sky}    />
-          <StatusBtn s="watch"    label="Watch"    color={G.gold}   />
-          <StatusBtn s="invested" label="Invested" color={G.mint}   />
-          <StatusBtn s="dead"     label="Dead"     color={G.rose}   />
+          <StatusBtn s="dealflow" label="Dealflow" color={G.sky}  />
+          <StatusBtn s="watch"    label="Watch"    color={G.gold} />
+          <StatusBtn s="invested" label="Invested" color={G.mint} />
+          <StatusBtn s="dead"     label="Dead"     color={G.rose} />
         </div>
-        <button onClick={onClose} style={{ position:"absolute", top:14, right:14, width:28, height:28, borderRadius:7,
-          background:G.ink4, border:"none", color:G.mist, cursor:"pointer", fontSize:15 }}>✕</button>
+        <button onClick={onClose} style={{ position:"absolute", top:14, right:14, width:28, height:28,
+          borderRadius:7, background:G.ink4, border:"none", color:G.mist, cursor:"pointer", fontSize:15 }}>✕</button>
       </div>
 
-      <div style={{ padding:18, display:"flex", flexDirection:"column", gap:14 }}>
+      <div style={{ flex:1, overflowY:"auto", padding:18 }}>
         {/* Assessment */}
-        <SectionLabel>AI Assessment</SectionLabel>
+        <SecLabel>Analyse AI</SecLabel>
         <div style={{ background:G.ink3, border:`1px solid ${G.ink4}`, borderRadius:10, padding:14, fontSize:12.5, lineHeight:1.75, color:G.fog }}>
-          {a.summary
-            ? <>
-                <p style={{ marginBottom:10 }}>{a.summary}</p>
-                {a.strengths?.length > 0 && (
-                  <div style={{ marginBottom:8 }}>
-                    <div style={{ fontSize:9, fontFamily:"monospace", color:G.mint, textTransform:"uppercase", letterSpacing:".8px", marginBottom:4 }}>Strengths</div>
-                    {a.strengths.map((s,i)=><div key={i} style={{ fontSize:12, color:G.fog, marginBottom:3 }}>• {s}</div>)}
-                  </div>
-                )}
-                {a.risks?.length > 0 && (
-                  <div>
-                    <div style={{ fontSize:9, fontFamily:"monospace", color:G.rose, textTransform:"uppercase", letterSpacing:".8px", marginBottom:4 }}>Risks</div>
-                    {a.risks.map((r,i)=><div key={i} style={{ fontSize:12, color:G.fog, marginBottom:3 }}>• {r}</div>)}
-                  </div>
-                )}
-              </>
-            : <div style={{ display:"flex", alignItems:"center", gap:8 }}><Dots /><span style={{ color:G.mist }}>Generating assessment…</span></div>
-          }
+          {a.summary ? (
+            <>
+              <p style={{ marginBottom:10 }}>{a.summary}</p>
+              {a.strengths?.length>0 && (
+                <div style={{ marginBottom:8 }}>
+                  <div style={{ fontSize:9, fontFamily:"monospace", color:G.mint, textTransform:"uppercase", letterSpacing:".8px", marginBottom:5 }}>Points forts</div>
+                  {a.strengths.map((s,i)=><div key={i} style={{ fontSize:12, marginBottom:3 }}>• {s}</div>)}
+                </div>
+              )}
+              {a.risks?.length>0 && (
+                <div>
+                  <div style={{ fontSize:9, fontFamily:"monospace", color:G.rose, textTransform:"uppercase", letterSpacing:".8px", marginBottom:5 }}>Risques</div>
+                  {a.risks.map((r,i)=><div key={i} style={{ fontSize:12, marginBottom:3 }}>• {r}</div>)}
+                </div>
+              )}
+            </>
+          ) : (
+            <div style={{ display:"flex", alignItems:"center", gap:8, color:G.mist }}>
+              <Dots /> <span>Analyse en cours…</span>
+            </div>
+          )}
         </div>
 
         {/* Scores */}
-        {sc.overall > 0 && (
+        {sc.overall>0 && (
           <>
-            <SectionLabel>Scores</SectionLabel>
+            <SecLabel>Scores</SecLabel>
             <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8 }}>
-              {[["Overall",sc.overall],["Team",sc.team],["Market",sc.market],["Product",sc.product]].map(([l,v])=>(
+              {[["Global",sc.overall],["Équipe",sc.team],["Marché",sc.market],["Produit",sc.product]].map(([l,v])=>(
                 <div key={l} style={{ background:G.ink3, border:`1px solid ${G.ink4}`, borderRadius:8, padding:"10px 13px" }}>
                   <div style={{ fontSize:9, fontFamily:"monospace", color:G.mist, textTransform:"uppercase", letterSpacing:".8px", marginBottom:4 }}>{l}</div>
-                  <div style={{ fontSize:22, fontWeight:800, color:scoreCol(v||0) }}>{v||"—"}<span style={{ fontSize:12, color:G.mist }}>/10</span></div>
+                  <div style={{ fontSize:22, fontWeight:800, color:scCol(v||0) }}>{v||"—"}<span style={{ fontSize:12, color:G.mist }}>/10</span></div>
                   <ScoreBar value={v||0} />
                 </div>
               ))}
@@ -348,13 +314,13 @@ function DetailPanel({ company, onClose, onStatusChange, onRefresh, onExport, on
         )}
 
         {/* Key metrics */}
-        {a.keyMetrics && Object.keys(a.keyMetrics).length > 0 && (
+        {a.keyMetrics && Object.keys(a.keyMetrics).length>0 && (
           <>
-            <SectionLabel>Key Metrics</SectionLabel>
+            <SecLabel>Métriques clés</SecLabel>
             <div style={{ background:G.ink3, border:`1px solid ${G.ink4}`, borderRadius:8, overflow:"hidden" }}>
-              {Object.entries(a.keyMetrics).map(([k,v],i)=>(
+              {Object.entries(a.keyMetrics).map(([k,v],i,arr)=>(
                 <div key={k} style={{ display:"flex", justifyContent:"space-between", padding:"7px 12px",
-                  borderBottom: i<Object.keys(a.keyMetrics).length-1 ? `1px solid ${G.ink4}` : "none" }}>
+                  borderBottom:i<arr.length-1?`1px solid ${G.ink4}`:"none" }}>
                   <span style={{ fontSize:10, fontFamily:"monospace", color:G.mist, textTransform:"uppercase" }}>{k}</span>
                   <span style={{ fontSize:12, fontWeight:600 }}>{v}</span>
                 </div>
@@ -363,25 +329,44 @@ function DetailPanel({ company, onClose, onStatusChange, onRefresh, onExport, on
           </>
         )}
 
+        {/* Files attached */}
+        {company.files?.length>0 && (
+          <>
+            <SecLabel>Documents ({company.files.length})</SecLabel>
+            <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
+              {company.files.map((f,i)=>(
+                <div key={i} style={{ background:G.ink3, border:`1px solid ${G.ink4}`, borderRadius:6, padding:"5px 10px", fontSize:11, display:"flex", alignItems:"center", gap:5 }}>
+                  <span>{fileIcon(f.name)}</span>
+                  <span style={{ color:G.fog }}>{f.name}</span>
+                  {f.size && <span style={{ color:G.mist, fontSize:9 }}>({f.size})</span>}
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+
         {/* News */}
-        <SectionLabel>News & Updates</SectionLabel>
-        {company.news?.length > 0
+        <SecLabel>Actualités</SecLabel>
+        {company.news?.length>0
           ? company.news.map((n,i)=>(
-              <div key={i} style={{ borderLeft:`2px solid ${G.sky}`, padding:"5px 10px", marginBottom:4 }}>
+              <div key={i} style={{ borderLeft:`2px solid ${G.sky}`, padding:"5px 10px", marginBottom:5 }}>
                 <div style={{ fontSize:9, color:G.mist, fontFamily:"monospace", marginBottom:2 }}>{n.date}</div>
                 <div style={{ fontSize:11, color:G.fog }}>{n.title}</div>
               </div>
             ))
-          : <div style={{ fontSize:12, color:G.mist }}>No news yet.</div>
+          : <div style={{ fontSize:12, color:G.mist }}>Aucune actualité.</div>
         }
 
         {/* Notes */}
-        {company.notes?.length > 0 && (
+        {company.notes?.length>0 && (
           <>
-            <SectionLabel>Notes</SectionLabel>
+            <SecLabel>Notes</SecLabel>
             {company.notes.map((n,i)=>(
-              <div key={i} style={{ borderLeft:`2px solid ${G.lime}`, borderRadius:"0 6px 6px 0", padding:"8px 12px", background:G.ink3, fontSize:12, color:G.fog, marginBottom:4 }}>
-                <div style={{ fontSize:9, fontFamily:"monospace", color:G.mist, marginBottom:3 }}>{new Date(n.date).toLocaleDateString("fr-FR")}</div>
+              <div key={i} style={{ borderLeft:`2px solid ${G.lime}`, borderRadius:"0 6px 6px 0",
+                padding:"8px 12px", background:G.ink3, fontSize:12, color:G.fog, marginBottom:5 }}>
+                <div style={{ fontSize:9, fontFamily:"monospace", color:G.mist, marginBottom:3 }}>
+                  {new Date(n.date).toLocaleDateString("fr-FR")}
+                </div>
                 {n.text}
               </div>
             ))}
@@ -389,27 +374,30 @@ function DetailPanel({ company, onClose, onStatusChange, onRefresh, onExport, on
         )}
 
         {/* Add note */}
-        <textarea value={noteText} onChange={e=>setNoteText(e.target.value)}
-          placeholder="Add a note…"
-          style={{ background:G.ink3, border:`1px solid ${G.ink4}`, borderRadius:8, color:G.paper, fontSize:12,
-            padding:"9px 12px", fontFamily:"inherit", resize:"vertical", minHeight:70, outline:"none" }} />
-        <Btn onClick={()=>{ if(noteText.trim()){ onNote(noteText.trim()); setNoteText(""); } }}>💾 Save Note</Btn>
+        <SecLabel>Ajouter une note</SecLabel>
+        <textarea value={note} onChange={e=>setNote(e.target.value)} placeholder="Note interne…"
+          style={{ background:G.ink3, border:`1px solid ${G.ink4}`, borderRadius:8, color:G.paper,
+            fontSize:12, padding:"9px 12px", fontFamily:"inherit", width:"100%", minHeight:70,
+            resize:"vertical", outline:"none", display:"block" }} />
+        <Btn style={{ marginTop:6, width:"100%", justifyContent:"center" }}
+          onClick={()=>{ if(note.trim()){ onChange({ notes:[{text:note.trim(),date:new Date().toISOString()},...(company.notes||[])] }); setNote(""); } }}>
+          💾 Sauvegarder la note
+        </Btn>
 
         {/* Actions */}
-        <SectionLabel>Actions</SectionLabel>
+        <SecLabel>Actions</SecLabel>
         <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
-          <Btn onClick={()=>onRefresh("assess")}>🔄 Re-assess</Btn>
-          <Btn onClick={()=>onRefresh("news")}>📰 Fetch News</Btn>
-          <Btn onClick={()=>onRefresh("report")}>📄 Gen. Report</Btn>
-          <Btn onClick={onExport} accent>⬇ Export .doc</Btn>
+          <Btn onClick={()=>onAction("reassess")}>🔄 Ré-analyser</Btn>
+          <Btn onClick={()=>onAction("news")}>📰 Actualités</Btn>
+          <Btn onClick={()=>onAction("report")}>📄 Générer rapport</Btn>
+          <Btn accent onClick={()=>onAction("export")}>⬇ Export .doc</Btn>
         </div>
 
-        {/* Report preview */}
         {company.report && (
           <>
-            <SectionLabel>Investment Memo Preview</SectionLabel>
+            <SecLabel>Mémo d'investissement</SecLabel>
             <div style={{ background:G.ink3, border:`1px solid ${G.ink4}`, borderRadius:8, padding:14,
-              fontSize:12, lineHeight:1.8, color:G.fog, whiteSpace:"pre-wrap", maxHeight:300, overflowY:"auto" }}>
+              fontSize:12, lineHeight:1.8, color:G.fog, whiteSpace:"pre-wrap", maxHeight:320, overflowY:"auto" }}>
               {company.report}
             </div>
           </>
@@ -421,260 +409,306 @@ function DetailPanel({ company, onClose, onStatusChange, onRefresh, onExport, on
 
 // ─── EMAIL IMPORT VIEW ────────────────────────────────────────────────────────
 function EmailImportView({ onImport, showToast }) {
-  const [provider,    setProvider]    = useState(null);
-  const [emails,      setEmails]      = useState([]);
-  const [loading,     setLoading]     = useState(false);
-  const [selected,    setSelected]    = useState(null);
-  const [pasteBody,   setPasteBody]   = useState("");
-  const [extracting,  setExtracting]  = useState(false);
-  const [extracted,   setExtracted]   = useState(null);
-  const [senderRole,  setSenderRole]  = useState("founder");
-  const [attachSel,   setAttachSel]   = useState(new Set());
-  const [useBody,     setUseBody]     = useState(true);
-  const [imapConf,    setImapConf]    = useState({ host:"", user:"", pass:"" });
+  const [provider,   setProvider]   = useState(null);
+  const [emails,     setEmails]     = useState([]);
+  const [loading,    setLoading]    = useState(false);
+  const [selected,   setSelected]   = useState(null);
+  const [extracting, setExtracting] = useState(false);
+  const [extracted,  setExtracted]  = useState(null);
+  const [senderRole, setSenderRole] = useState("founder");
+  const [attachSel,  setAttachSel]  = useState(new Set());
+  const [useBody,    setUseBody]    = useState(true);
+  const [pasteText,  setPasteText]  = useState("");
+  const [fileExtracting, setFileExtracting] = useState(false);
+  const [fileContents,   setFileContents]   = useState({}); // idx -> extracted text
 
-  const emailUrl = {
-    gmail:      "https://gmailmcp.googleapis.com/mcp/v1",
-    roundcube:  null, // IMAP bridge
-    ovh:        null, // IMAP bridge
-    outlook:    null,
-  };
-
-  // Load Gmail via MCP
-  async function loadGmail() {
-    setLoading(true); setEmails([]);
-    try {
-      const raw = await callClaude(
-        "Fetch my 15 most recent emails. For each return: id, from name (fromName), fromEmail, subject, date ISO, body snippet (first 200 chars), hasAttachments boolean, attachments array [{name,size}]. Return ONLY a JSON array.",
-        "You fetch emails via Gmail MCP. Return ONLY valid JSON array.",
-        { maxTokens:1500, mcpServers:[{ type:"url", url: emailUrl.gmail, name:"gmail" }] }
-      );
-      const clean = raw.replace(/```json|```/g,"").trim();
-      const arr   = JSON.parse(clean);
-      setEmails(arr.map(e=>({
-        id: e.id||uid(),
-        from: e.fromName||e.from||"Unknown",
-        fromEmail: e.fromEmail||e.email||"",
-        subject: e.subject||"(no subject)",
-        date: e.date||new Date().toISOString(),
-        body: e.body||e.snippet||"",
-        attachments: (e.attachments||[]).map(a=>typeof a==="string"?{name:a,size:"?"}:a),
-        unread: e.unread||false,
-        provider:"gmail",
-      })));
-    } catch {
-      // Demo fallback
-      loadDemo();
-      showToast("Gmail: using demo data (enable Gmail MCP in settings)");
-    }
-    setLoading(false);
-  }
-
-  // IMAP-style: for Roundcube / OVH — user provides IMAP credentials + paste
-  function imapNote() {
-    return (
-      <div style={{ background:G.ink3, border:`1px solid ${G.ink4}`, borderRadius:10, padding:16, marginBottom:16 }}>
-        <div style={{ fontSize:13, fontWeight:700, marginBottom:8, color:G.fog }}>IMAP / Roundcube / OVH Mail</div>
-        <div style={{ fontSize:12, color:G.mist, lineHeight:1.7, marginBottom:12 }}>
-          Roundcube and OVH Mail don't expose an OAuth MCP connector. Two options:<br/>
-          <b style={{color:G.fog}}>1)</b> Forward the email to Gmail and use the Gmail import above.<br/>
-          <b style={{color:G.fog}}>2)</b> Paste the email body directly below (select "Paste email" provider).
-        </div>
-        <div style={{ fontSize:11, color:G.mist }}>
-          Native IMAP integration (via server-side bridge) can be added by your IT team using the open-source
-          <span style={{ color:G.sky }}> Dealflow OS IMAP Bridge</span> (configuration exported with this app).
-        </div>
-      </div>
-    );
-  }
-
-  function loadDemo() {
-    setEmails([
-      { id:"d1", from:"Sophie Martin", fromEmail:"sophie@neuralpath.ai", subject:"NeuralPath — Series A deck", date:"2024-12-10T09:23:00", unread:true, provider:"gmail",
-        body:"Hi,\n\nFollowing VivaTech, sharing our Series A deck. NeuralPath builds enterprise document AI — proprietary models outperform GPT-4 by 23%. €2.8M ARR, 52 enterprise clients, growing 18% MoM. Raising €8M.\n\nBest, Sophie",
-        attachments:[{name:"NeuralPath_SeriesA_Deck.pdf",size:"4.2 MB"},{name:"NeuralPath_Financials.xlsx",size:"890 KB"}] },
-      { id:"d2", from:"Marc Leblanc", fromEmail:"marc@venturebridge.fr", subject:"Intro — GreenFlow (ESG SaaS, Seed)", date:"2024-12-09T15:42:00", unread:true, provider:"gmail",
-        body:"Dear team,\n\nIntroducing GreenFlow, automating CSRD carbon accounting. €420K ARR, 12 clients, unit-economics positive. Seeking €3M Seed extension.\n\nMarc Leblanc, Partner — VentureBridge",
-        attachments:[{name:"GreenFlow_Deck_Dec24.pdf",size:"5.1 MB"},{name:"GreenFlow_OnePager.pdf",size:"780 KB"}] },
-      { id:"d3", from:"Thomas Keller", fromEmail:"thomas@quantumpay.io", subject:"QuantumPay — follow-up from our call", date:"2024-12-07T16:55:00", unread:false, provider:"gmail",
-        body:"Hi,\n\nQuantumPay: quantum-resistant payment orchestration for European banks. 2 bank pilots (ING, Deutsche Bank sub). €1.5M pre-seed closed. Raising €4M Seed.\n\nThomas Keller, CEO",
-        attachments:[{name:"QuantumPay_Deck.pdf",size:"3.8 MB"},{name:"QuantumPay_Whitepaper.pdf",size:"1.2 MB"}] },
-      { id:"d4", from:"Léa Fontaine", fromEmail:"lea@climatebridge.vc", subject:"Fwd: Solaris Energy — pre-seed", date:"2024-12-06T10:20:00", unread:true, provider:"gmail",
-        body:"FYI forwarding from network. Solaris Energy: AI-optimised energy storage dispatch, reduces industrial energy costs 28%. 5 pilots in France, targeting €600K ARR by Q2 2025. Raising €2M pre-seed.",
-        attachments:[{name:"Solaris_PitchDeck.pptx",size:"7.2 MB"}] },
-    ]);
-  }
-
-  function selectEmail(e) {
-    setSelected(e);
-    setAttachSel(new Set(e.attachments?.map((_,i)=>i)||[]));
-    setExtracted(null);
-    setSenderRole(guessRole(e.from, e.fromEmail, e.body));
-    doExtract(e);
-  }
-
-  function guessRole(name, email, body) {
-    const b = (body||"").toLowerCase();
+  // Guess sender role from email body
+  const guessRole = (body="") => {
+    const b = body.toLowerCase();
     if (b.includes("ceo")||b.includes("founder")||b.includes("co-founder")) return "founder";
     if (b.includes("partner")||b.includes("on behalf")||b.includes("portfolio")) return "investor";
     if (b.includes("intro")||b.includes("behalf")||b.includes("fyi")) return "intermediary";
     return "founder";
-  }
+  };
 
-  async function doExtract(e) {
+  // Load demo emails
+  const loadDemo = () => {
+    setEmails([
+      { id:"d1", fromName:"Sophie Martin", fromEmail:"sophie@neuralpath.ai",
+        subject:"NeuralPath — deck Series A", date:"2024-12-10T09:23:00", bodySnippet:
+        "Bonjour,\n\nSuite à VivaTech, je vous transmets notre deck Series A.\n\nNeuralPath construit l'infrastructure IA pour le traitement intelligent de documents d'entreprise — nos modèles propriétaires surpassent GPT-4 de 23% sur les tâches documentaires structurées.\n\nMétriques : €2,8M ARR, 52 clients entreprise, +18% MoM. Levée : €8M Series A.\n\nCordialement, Sophie Martin — Head of BD, NeuralPath",
+        hasAttachments:true, attachments:[{name:"NeuralPath_SeriesA.pdf",mimeType:"application/pdf",size:"4.2 MB"},{name:"NeuralPath_Financials.xlsx",size:"890 KB"},{name:"NeuralPath_ExecutiveSummary.docx",size:"340 KB"}] },
+      { id:"d2", fromName:"Marc Leblanc", fromEmail:"marc@venturebridge.fr",
+        subject:"Introduction — GreenFlow (ESG SaaS)", date:"2024-12-09T15:42:00", bodySnippet:
+        "Bonjour,\n\nJe vous présente GreenFlow, qui automatise la comptabilité carbone et la conformité CSRD. €420K ARR, 12 clients, économies unitaires positives. Recherche €3M Seed.\n\nMarc Leblanc, Partner — VentureBridge",
+        hasAttachments:true, attachments:[{name:"GreenFlow_Deck.pdf",size:"5.1 MB"},{name:"GreenFlow_OnePager.pdf",size:"780 KB"}] },
+      { id:"d3", fromName:"Thomas Keller", fromEmail:"thomas@quantumpay.io",
+        subject:"QuantumPay — suite à notre call", date:"2024-12-07T16:55:00", bodySnippet:
+        "Bonjour,\n\nQuantumPay : orchestration de paiements résistante au quantique pour les banques européennes. 2 pilotes bancaires (ING, filiale Deutsche Bank). €1,5M pre-seed. Levée €4M Seed.\n\nThomas Keller, CEO — QuantumPay",
+        hasAttachments:true, attachments:[{name:"QuantumPay_Deck.pdf",size:"3.8 MB"},{name:"QuantumPay_Whitepaper.pdf",size:"1.2 MB"}] },
+    ]);
+  };
+
+  // Load real Gmail via proxy
+  const loadGmail = async () => {
+    setLoading(true);
+    try {
+      const data = await loadGmailEmails();
+      setEmails(data.map(e=>({
+        id:       e.id || uid(),
+        fromName: e.fromName || e.from || "Inconnu",
+        fromEmail:e.fromEmail || "",
+        subject:  e.subject || "(sans objet)",
+        date:     e.date || new Date().toISOString(),
+        bodySnippet: e.bodySnippet || e.body || "",
+        hasAttachments: e.hasAttachments || false,
+        attachments: e.attachments || [],
+      })));
+      showToast("Emails Gmail chargés");
+    } catch (err) {
+      console.error("Gmail error:", err);
+      showToast("Gmail non disponible — chargement de la démo");
+      loadDemo();
+    }
+    setLoading(false);
+  };
+
+  const selectEmail = async (email) => {
+    setSelected(email);
+    setExtracted(null);
+    setFileContents({});
+    setSenderRole(guessRole(email.bodySnippet));
+    setAttachSel(new Set(email.attachments?.map((_,i)=>i) || []));
+    await doExtract(email);
+  };
+
+  const doExtract = async (email) => {
     setExtracting(true);
-    const attachNames = (e.attachments||[]).map(a=>a.name).join(", ");
-    const d = await callClaudeJSON(
-      `Extract startup info from this email.\nFrom: ${e.from} <${e.fromEmail}>\nSubject: ${e.subject}\nBody: ${(e.body||"").slice(0,1500)}\nAttachments: ${attachNames||"none"}\n\nReturn JSON: { "name":"company name", "website":"url or empty", "sector":"one of the standard sectors", "stage":"Pre-seed|Seed|Series A|Series B|Series C+", "location":"city,country", "year":"founding year or empty", "description":"2-3 sentence description", "raisingAmount":"amount raising or empty", "arr":"ARR if mentioned or empty", "highlights":["fact1","fact2","fact3"] }`,
-      "You are a senior VC analyst extracting structured data from a startup pitch email. Be precise."
-    );
-    setExtracted(d || {});
-    setExtracting(false);
-  }
+    const context = [
+      `De : ${email.fromName} <${email.fromEmail}>`,
+      `Objet : ${email.subject}`,
+      `Corps : ${(email.bodySnippet||"").slice(0,2000)}`,
+      email.attachments?.length ? `Pièces jointes : ${email.attachments.map(a=>a.name).join(", ")}` : "",
+    ].filter(Boolean).join("\n");
 
-  async function doPasteExtract() {
-    if (!pasteBody.trim()) return;
+    const result = await callClaudeJSON(
+      `Extrais les informations de cette startup depuis cet email VC :\n\n${context}\n\n
+Retourne un objet JSON avec ces champs exacts :
+{
+  "name": "nom de l'entreprise",
+  "website": "url ou vide",
+  "sector": "un des secteurs standards (AI, FinTech, HealthTech, etc.)",
+  "stage": "Pre-seed|Seed|Series A|Series B|Series C+",
+  "location": "ville, pays",
+  "year": "année de création ou vide",
+  "description": "description 2-3 phrases",
+  "raisingAmount": "montant levée ou vide",
+  "arr": "ARR si mentionné ou vide",
+  "highlights": ["fait clé 1", "fait clé 2", "fait clé 3"]
+}`,
+      "Tu es un analyste VC senior. Extrait des données structurées depuis un email de pitch."
+    );
+    setExtracted(result || {});
+    setExtracting(false);
+  };
+
+  // Handle real file upload on attachments
+  const handleAttachFiles = async (files) => {
+    setFileExtracting(true);
+    const results = {};
+    for (const [i, file] of files.entries()) {
+      try {
+        const extracted = await extractFileContent(file);
+        results[`upload_${i}`] = { name: file.name, content: extracted.content };
+        showToast(`Fichier extrait : ${file.name}`);
+      } catch (err) {
+        showToast(`Erreur : ${file.name}`);
+      }
+    }
+    setFileContents(prev => ({ ...prev, ...results }));
+
+    // Re-extract with file content appended
+    if (selected && Object.keys(results).length > 0) {
+      const addedContent = Object.values(results).map(f=>`\n\n[${f.name}]\n${f.content}`).join("");
+      const enriched = { ...selected, bodySnippet: (selected.bodySnippet||"") + addedContent };
+      await doExtract(enriched);
+    }
+    setFileExtracting(false);
+  };
+
+  // Paste mode extract
+  const doPasteExtract = async () => {
+    if (!pasteText.trim()) return;
     setExtracting(true);
-    const d = await callClaudeJSON(
-      `Extract startup info from this pasted email/document content.\n\n${pasteBody.slice(0,2000)}\n\nReturn JSON: { "name":"company name", "website":"url or empty", "sector":"sector", "stage":"stage", "location":"city,country", "year":"year", "description":"2-3 sentences", "raisingAmount":"raising amount", "arr":"ARR", "highlights":["fact1","fact2","fact3"] }`,
-      "Extract structured startup data. Return ONLY valid JSON."
-    );
-    const fakeEmail = { id:uid(), from:"Pasted", fromEmail:"", subject:"Pasted content", date:new Date().toISOString(), body:pasteBody, attachments:[], provider:"manual" };
-    setSelected(fakeEmail);
-    setExtracted(d || {});
-    setExtracting(false);
-  }
+    const fake = { id:uid(), fromName:"Collé", fromEmail:"", subject:"Contenu collé",
+      date:new Date().toISOString(), bodySnippet:pasteText, attachments:[] };
+    setSelected(fake);
+    await doExtract(fake);
+  };
 
-  function doImport() {
+  const doImport = () => {
     const ex = extracted || {};
-    const name = ex.name || selected?.subject || "Unknown";
+    const name = ex.name || selected?.subject || "Startup inconnue";
+    const attachUsed = [...attachSel].map(i=>selected?.attachments?.[i]).filter(Boolean);
+    const allFileContents = Object.values(fileContents).map(f=>f.content).join("\n\n");
+
     const company = {
       id: uid(), name, status:"dealflow",
-      url:        ex.website || "",
-      sector:     ex.sector  || "Other",
-      stage:      ex.stage   || "Seed",
-      location:   ex.location|| "",
-      year:       ex.year    || "",
-      description:ex.description || selected?.body?.slice(0,500) || "",
-      raising:    ex.raisingAmount || "",
-      arr:        ex.arr || "",
+      url:         ex.website || "",
+      sector:      ex.sector  || "Other",
+      stage:       ex.stage   || "Seed",
+      location:    ex.location|| "",
+      year:        ex.year    || "",
+      description: [ex.description, allFileContents].filter(Boolean).join("\n\n").slice(0, 3000),
+      raising:     ex.raisingAmount || "",
+      arr:         ex.arr || "",
       addedAt: new Date().toISOString(), source:"email",
+      files: attachUsed.map(a=>({ name:a.name, size:a.size })),
       sourceEmail: {
-        from: selected?.from||"",
-        fromEmail: selected?.fromEmail||"",
-        role: senderRole,
-        subject: selected?.subject||"",
-        date: selected?.date||"",
-        attachmentsUsed: [...attachSel].map(i=>selected?.attachments?.[i]?.name).filter(Boolean),
-        bodyUsed: useBody,
-        provider: provider||"manual",
+        from: selected?.fromName||"", fromEmail:selected?.fromEmail||"",
+        role: senderRole, subject:selected?.subject||"",
+        date: selected?.date||"", provider: provider||"paste",
+        attachmentsUsed: attachUsed.map(a=>a.name), bodyUsed: useBody,
       },
       assessment:null, scores:null, news:[], notes:[], tags:[],
     };
     onImport(company);
-    showToast(`"${name}" imported to Dealflow`);
-    setSelected(null); setExtracted(null); setEmails([]);
-  }
+    setSelected(null); setExtracted(null); setProvider(null);
+  };
 
-  // ── PROVIDER SELECTION ──
+  // ── Provider selection screen ──
   if (!provider) {
     return (
-      <div style={{ maxWidth:600 }}>
-        <div style={{ fontSize:14, fontWeight:700, marginBottom:6 }}>Select email source</div>
+      <div style={{ maxWidth:560 }}>
+        <div style={{ fontSize:14, fontWeight:700, marginBottom:6 }}>Choisir la source email</div>
         <div style={{ fontSize:12, color:G.mist, marginBottom:20, lineHeight:1.7 }}>
-          Import a pitch directly from your inbox — body, attachments, sender info all extracted by AI automatically.
-          Data is processed with the <span style={{ color:G.lime }}>no-training</span> flag: your deal data is never used to train AI models.
+          Importez un pitch directement depuis votre boîte mail — corps, pièces jointes et infos expéditeur
+          extraits automatiquement par l'IA. Toutes les données sont traitées avec le flag <span style={{ color:G.lime }}>no-training</span>.
         </div>
-        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
+        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginBottom:20 }}>
           {WEBMAILS.map(wm=>(
-            <div key={wm.id} onClick={()=>setProvider(wm.id)}
-              style={{ background:G.ink3, border:`1px solid ${G.ink4}`, borderRadius:12, padding:16, cursor:"pointer", transition:"all .18s" }}
+            <div key={wm.id} onClick={()=>{ setProvider(wm.id); if(wm.id==="gmail") loadGmail(); if(wm.id==="paste") {} }}
+              style={{ background:G.ink3, border:`1px solid ${G.ink4}`, borderRadius:12, padding:16,
+                cursor:"pointer", transition:"all .18s" }}
               onMouseOver={e=>e.currentTarget.style.borderColor=wm.color}
               onMouseOut={e=>e.currentTarget.style.borderColor=G.ink4}>
               <div style={{ fontSize:28, marginBottom:8 }}>{wm.icon}</div>
-              <div style={{ fontSize:13, fontWeight:700, marginBottom:3 }}>{wm.label}</div>
-              <div style={{ fontSize:10, color:G.mist, fontFamily:"monospace" }}>{wm.hint}</div>
+              <div style={{ fontSize:13, fontWeight:700, marginBottom:2 }}>{wm.label}</div>
             </div>
           ))}
         </div>
+        {/* Direct file upload without email */}
+        <div style={{ background:G.ink2, border:`1px solid ${G.ink4}`, borderRadius:12, padding:16 }}>
+          <div style={{ fontSize:13, fontWeight:700, marginBottom:8 }}>📁 Uploader directement des fichiers</div>
+          <div style={{ fontSize:12, color:G.mist, marginBottom:12 }}>PDF, Word, PowerPoint, Excel, images, TXT… L'IA extrait tout le contenu automatiquement.</div>
+          <DropZone onFiles={async (files) => {
+            setProvider("paste");
+            setExtracting(true);
+            let combined = "";
+            for (const file of files) {
+              try {
+                const r = await extractFileContent(file);
+                combined += `\n\n[${file.name}]\n${r.content}`;
+                showToast(`Extrait : ${file.name}`);
+              } catch { showToast(`Erreur : ${file.name}`); }
+            }
+            setPasteText(combined.trim());
+            const fake = { id:uid(), fromName:"Upload", fromEmail:"", subject:"Fichiers uploadés",
+              date:new Date().toISOString(), bodySnippet:combined, attachments:[] };
+            setSelected(fake);
+            await doExtract(fake);
+          }} />
+        </div>
       </div>
     );
   }
 
-  // ── IMAP NOTE ──
+  // ── Roundcube / OVH fallback ──
   if (provider==="roundcube"||provider==="ovh") {
     return (
-      <div style={{ maxWidth:580 }}>
-        <Btn ghost onClick={()=>setProvider(null)} sm>← Back</Btn>
-        <div style={{ marginTop:16 }}>{imapNote()}</div>
-        <Btn onClick={()=>setProvider("manual")}>📋 Paste email instead</Btn>
+      <div style={{ maxWidth:560 }}>
+        <Btn ghost onClick={()=>setProvider(null)} sm>← Retour</Btn>
+        <div style={{ background:G.ink3, border:`1px solid ${G.ink4}`, borderRadius:12, padding:16, marginTop:16 }}>
+          <div style={{ fontSize:13, fontWeight:700, marginBottom:8 }}>Roundcube / OVH Mail</div>
+          <div style={{ fontSize:12, color:G.mist, lineHeight:1.7 }}>
+            Ces webmails ne supportent pas de connexion OAuth directe.<br/>
+            <strong style={{color:G.fog}}>Solution 1 :</strong> Transférez l'email vers Gmail et utilisez l'import Gmail.<br/>
+            <strong style={{color:G.fog}}>Solution 2 :</strong> Copiez-collez le contenu de l'email ci-dessous.
+          </div>
+        </div>
+        <Btn style={{ marginTop:12 }} onClick={()=>setProvider("paste")}>📋 Coller le contenu</Btn>
       </div>
     );
   }
 
-  // ── PASTE / MANUAL ──
-  if (provider==="manual") {
+  // ── Paste mode ──
+  if (provider==="paste") {
     return (
-      <div style={{ maxWidth:580 }}>
+      <div style={{ maxWidth:600 }}>
         <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:16 }}>
-          <Btn ghost onClick={()=>setProvider(null)} sm>← Back</Btn>
-          <span style={{ fontSize:13, fontWeight:700 }}>Paste email content</span>
+          <Btn ghost onClick={()=>setProvider(null)} sm>← Retour</Btn>
+          <span style={{ fontSize:13, fontWeight:700 }}>Coller un email ou contenu</span>
         </div>
-        <div style={{ fontSize:11, color:G.mist, marginBottom:10 }}>
-          Paste the email body (and/or deck content) below. AI will extract all company information automatically.
-        </div>
-        <textarea value={pasteBody} onChange={e=>setPasteBody(e.target.value)}
-          placeholder="Paste email body, pitch deck text, or any content about the startup here…"
+        <textarea value={pasteText} onChange={e=>setPasteText(e.target.value)}
+          placeholder="Collez ici le corps de l'email, le contenu d'un deck ou toute information sur la startup…"
           style={{ background:G.ink3, border:`1px solid ${G.ink4}`, borderRadius:8, color:G.paper,
-            fontSize:12, padding:"10px 12px", fontFamily:"inherit", width:"100%", minHeight:180, resize:"vertical", outline:"none" }} />
-        <div style={{ display:"flex", gap:8, marginTop:10 }}>
-          <Btn accent onClick={doPasteExtract}>{extracting ? <><Spinner /> Extracting…</> : "✨ Extract & Import"}</Btn>
+            fontSize:12, padding:"10px 12px", fontFamily:"inherit", width:"100%", minHeight:160,
+            resize:"vertical", outline:"none", marginBottom:10 }} />
+        <div style={{ marginBottom:12 }}>
+          <DropZone compact onFiles={async (files) => {
+            setFileExtracting(true);
+            for (const file of files) {
+              try {
+                const r = await extractFileContent(file);
+                setPasteText(p=>p+(p?"\n\n":"")+`[${file.name}]\n${r.content}`);
+                showToast(`Extrait : ${file.name}`);
+              } catch { showToast(`Erreur : ${file.name}`); }
+            }
+            setFileExtracting(false);
+          }} />
+          {fileExtracting && <div style={{ display:"flex", gap:8, alignItems:"center", marginTop:8, fontSize:12, color:G.lime }}><Dots/> Extraction en cours…</div>}
         </div>
+        <Btn accent onClick={doPasteExtract} disabled={extracting||!pasteText.trim()}>
+          {extracting?<><Spin/> Extraction…</>:"✨ Extraire & Importer"}
+        </Btn>
         {extracted && !extracting && (
           <ExtractForm extracted={extracted} setExtracted={setExtracted}
-            senderRole={senderRole} setSenderRole={setSenderRole}
-            onImport={doImport} />
+            senderRole={senderRole} setSenderRole={setSenderRole} onImport={doImport} />
         )}
       </div>
     );
   }
 
-  // ── GMAIL / OUTLOOK ──
+  // ── Gmail / email list ──
   return (
-    <div style={{ display:"flex", gap:16, height:"calc(100vh - 120px)" }}>
-      {/* Email list */}
-      <div style={{ width:280, minWidth:280, background:G.ink2, border:`1px solid ${G.ink4}`, borderRadius:12, overflow:"hidden", display:"flex", flexDirection:"column" }}>
-        <div style={{ padding:"12px 14px", borderBottom:`1px solid ${G.ink4}`, display:"flex", alignItems:"center", gap:8 }}>
+    <div style={{ display:"flex", gap:16, height:"calc(100vh - 140px)" }}>
+      {/* Email list sidebar */}
+      <div style={{ width:270, minWidth:270, background:G.ink2, border:`1px solid ${G.ink4}`,
+        borderRadius:12, overflow:"hidden", display:"flex", flexDirection:"column" }}>
+        <div style={{ padding:"11px 13px", borderBottom:`1px solid ${G.ink4}`, display:"flex", alignItems:"center", gap:8 }}>
           <Btn ghost onClick={()=>setProvider(null)} sm>←</Btn>
-          <span style={{ fontSize:12, fontWeight:700, flex:1 }}>
-            {provider==="gmail" ? "📧 Gmail" : "📘 Outlook"}
-          </span>
-          <Btn sm onClick={provider==="gmail" ? loadGmail : loadDemo}>{loading ? <Spinner/> : "↻"}</Btn>
+          <span style={{ fontSize:12, fontWeight:700, flex:1 }}>📧 Gmail</span>
+          <Btn sm onClick={loadGmail} disabled={loading}>{loading?<Spin/>:"↻"}</Btn>
         </div>
-        {emails.length===0 && !loading && (
+        {!emails.length && !loading && (
           <div style={{ padding:20, textAlign:"center" }}>
-            <div style={{ fontSize:13, color:G.mist, marginBottom:12 }}>No emails loaded</div>
-            <Btn accent onClick={provider==="gmail" ? loadGmail : loadDemo}>
-              {provider==="gmail" ? "📥 Load Gmail" : "📥 Load Outlook"}
-            </Btn>
-            <div style={{ marginTop:8 }}><Btn sm onClick={loadDemo}>Demo emails</Btn></div>
+            <div style={{ fontSize:13, color:G.mist, marginBottom:10 }}>Aucun email chargé</div>
+            <Btn accent onClick={loadGmail} style={{ width:"100%", justifyContent:"center" }}>📥 Charger Gmail</Btn>
+            <div style={{ marginTop:8 }}><Btn sm onClick={loadDemo}>Démo</Btn></div>
           </div>
         )}
-        {loading && <div style={{ padding:20, display:"flex", gap:8, alignItems:"center", color:G.mist, fontSize:12 }}><Dots/> Loading…</div>}
+        {loading && <div style={{ padding:16, display:"flex", gap:8, alignItems:"center", color:G.mist, fontSize:12 }}><Dots/> Chargement…</div>}
         <div style={{ flex:1, overflowY:"auto" }}>
-          {emails.map(e=>(
-            <div key={e.id} onClick={()=>selectEmail(e)}
-              style={{ padding:"10px 14px", cursor:"pointer", borderBottom:`1px solid ${G.ink4}`,
-                background: selected?.id===e.id ? G.ink3 : "transparent",
-                borderLeft: selected?.id===e.id ? `2px solid ${G.lime}` : "2px solid transparent" }}>
-              <div style={{ fontSize:11, fontWeight: e.unread?700:600, marginBottom:2, display:"flex", alignItems:"center", gap:5 }}>
-                {e.unread && <span style={{ width:6, height:6, borderRadius:"50%", background:G.lime, display:"inline-block" }} />}
-                {e.from}
-              </div>
-              <div style={{ fontSize:11, color: e.unread?G.fog:G.mist, marginBottom:2, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{e.subject}</div>
+          {emails.map(email=>(
+            <div key={email.id} onClick={()=>selectEmail(email)}
+              style={{ padding:"10px 13px", cursor:"pointer", borderBottom:`1px solid ${G.ink4}`,
+                background:selected?.id===email.id?G.ink3:"transparent",
+                borderLeft:`2px solid ${selected?.id===email.id?G.lime:"transparent"}` }}>
+              <div style={{ fontSize:11, fontWeight:700, marginBottom:2, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{email.fromName}</div>
+              <div style={{ fontSize:11, color:G.fog, marginBottom:2, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{email.subject}</div>
               <div style={{ display:"flex", gap:5, alignItems:"center" }}>
-                <span style={{ fontSize:9, color:G.mist, fontFamily:"monospace" }}>{new Date(e.date).toLocaleDateString("fr-FR")}</span>
-                {e.attachments?.length>0 && <Tag text={`📎 ${e.attachments.length}`} color={G.sky} />}
+                <span style={{ fontSize:9, color:G.mist, fontFamily:"monospace" }}>{new Date(email.date).toLocaleDateString("fr-FR")}</span>
+                {email.hasAttachments && <Tag text={`📎 ${email.attachments?.length||"+"}`} color={G.sky} />}
               </div>
             </div>
           ))}
@@ -683,96 +717,103 @@ function EmailImportView({ onImport, showToast }) {
 
       {/* Email detail + extract */}
       <div style={{ flex:1, overflowY:"auto" }}>
-        {!selected && (
+        {!selected ? (
           <div style={{ display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", height:"100%", color:G.mist }}>
             <div style={{ fontSize:40, marginBottom:12, opacity:.3 }}>📨</div>
-            <div style={{ fontSize:13 }}>Select an email to extract startup info</div>
+            <div style={{ fontSize:13 }}>Sélectionnez un email</div>
           </div>
-        )}
-        {selected && (
-          <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
+        ) : (
+          <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
             {/* Header */}
             <div style={{ background:G.ink2, border:`1px solid ${G.ink4}`, borderRadius:12, padding:16 }}>
               <div style={{ fontSize:15, fontWeight:700, marginBottom:10 }}>{selected.subject}</div>
               <div style={{ display:"flex", alignItems:"flex-start", gap:10, marginBottom:10 }}>
-                <Avatar name={selected.from} size={32} />
+                <Avatar name={selected.fromName||"?"} size={32} />
                 <div>
-                  <div style={{ fontSize:12, fontWeight:700 }}>{selected.from}</div>
+                  <div style={{ fontSize:12, fontWeight:700 }}>{selected.fromName}</div>
                   <div style={{ fontSize:10, color:G.mist, fontFamily:"monospace", marginBottom:6 }}>{selected.fromEmail}</div>
                   <div style={{ display:"flex", gap:5 }}>
                     {["founder","investor","intermediary"].map(r=>(
-                      <button key={r} onClick={()=>setSenderRole(r)}
-                        style={{ fontSize:10, padding:"3px 9px", borderRadius:20, cursor:"pointer", fontFamily:"monospace", fontWeight:600, textTransform:"uppercase", letterSpacing:".5px",
-                          border:`1px solid ${senderRole===r ? (r==="founder"?G.lime:r==="investor"?G.sky:G.lav) : G.ink4}`,
-                          background: senderRole===r ? `${(r==="founder"?G.lime:r==="investor"?G.sky:G.lav)}18` : G.ink4,
-                          color: senderRole===r ? (r==="founder"?G.lime:r==="investor"?G.sky:G.lav) : G.mist }}>
-                        {r==="founder"?"Founder/CEO":r==="investor"?"Investor":"Intermediary"}
+                      <button key={r} onClick={()=>setSenderRole(r)} style={{
+                        fontSize:10, padding:"3px 9px", borderRadius:20, cursor:"pointer",
+                        fontFamily:"monospace", fontWeight:600, textTransform:"uppercase", letterSpacing:".5px",
+                        border:`1px solid ${senderRole===r?(r==="founder"?G.lime:r==="investor"?G.sky:G.lav):G.ink4}`,
+                        background:senderRole===r?`${(r==="founder"?G.lime:r==="investor"?G.sky:G.lav)}18`:G.ink4,
+                        color:senderRole===r?(r==="founder"?G.lime:r==="investor"?G.sky:G.lav):G.mist,
+                      }}>
+                        {r==="founder"?"Fondateur":r==="investor"?"Investisseur":"Intermédiaire"}
                       </button>
                     ))}
                   </div>
                 </div>
               </div>
-              <div style={{ fontSize:11, color:G.mist, fontFamily:"monospace" }}>
-                {new Date(selected.date).toLocaleString("fr-FR")}
-              </div>
             </div>
 
             {/* Body */}
             <div style={{ background:G.ink2, border:`1px solid ${G.ink4}`, borderRadius:12, overflow:"hidden" }}>
-              <div style={{ padding:"10px 14px", borderBottom:`1px solid ${G.ink4}`, display:"flex", alignItems:"center", gap:8 }}>
-                <span style={{ fontSize:10, fontFamily:"monospace", color:G.mist, textTransform:"uppercase", letterSpacing:".8px", flex:1 }}>Email Body</span>
+              <div style={{ padding:"9px 13px", borderBottom:`1px solid ${G.ink4}`, display:"flex", alignItems:"center", gap:8 }}>
+                <span style={{ fontSize:10, fontFamily:"monospace", color:G.mist, textTransform:"uppercase", letterSpacing:".8px", flex:1 }}>Corps de l'email</span>
                 <label style={{ display:"flex", alignItems:"center", gap:6, cursor:"pointer", fontSize:11, color:G.fog }}>
                   <input type="checkbox" checked={useBody} onChange={e=>setUseBody(e.target.checked)} style={{ accentColor:G.lime }} />
-                  Use as context
+                  Utiliser comme contexte
                 </label>
               </div>
-              <div style={{ padding:14, fontSize:11.5, lineHeight:1.75, color:G.fog, whiteSpace:"pre-wrap", maxHeight:200, overflowY:"auto", background:G.ink3 }}>
-                {selected.body}
+              <div style={{ padding:13, fontSize:11.5, lineHeight:1.75, color:G.fog, whiteSpace:"pre-wrap", maxHeight:180, overflowY:"auto", background:G.ink3 }}>
+                {selected.bodySnippet}
               </div>
             </div>
 
             {/* Attachments */}
-            {selected.attachments?.length > 0 && (
+            {selected.attachments?.length>0 && (
               <div style={{ background:G.ink2, border:`1px solid ${G.ink4}`, borderRadius:12, overflow:"hidden" }}>
-                <div style={{ padding:"10px 14px", borderBottom:`1px solid ${G.ink4}`, display:"flex", alignItems:"center", gap:8 }}>
-                  <span style={{ fontSize:10, fontFamily:"monospace", color:G.mist, textTransform:"uppercase", letterSpacing:".8px", flex:1 }}>
-                    Attachments ({selected.attachments.length})
+                <div style={{ padding:"9px 13px", borderBottom:`1px solid ${G.ink4}`, display:"flex", alignItems:"center", gap:8 }}>
+                  <span style={{ fontSize:10, fontFamily:"monospace", color:G.mist, textTransform:"uppercase", flex:1 }}>
+                    Pièces jointes ({selected.attachments.length})
                   </span>
-                  <Btn sm onClick={()=>setAttachSel(new Set(selected.attachments.map((_,i)=>i)))}>All</Btn>
-                  <Btn sm onClick={()=>setAttachSel(new Set())}>None</Btn>
-                  <span style={{ fontSize:10, color:G.lime, fontFamily:"monospace" }}>{attachSel.size} selected</span>
+                  <Btn sm onClick={()=>setAttachSel(new Set(selected.attachments.map((_,i)=>i)))}>Tout</Btn>
+                  <Btn sm onClick={()=>setAttachSel(new Set())}>Aucun</Btn>
+                  <span style={{ fontSize:10, color:G.lime, fontFamily:"monospace" }}>{attachSel.size} sélectionné(s)</span>
                 </div>
-                <div style={{ padding:12, display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(160px,1fr))", gap:8 }}>
+                <div style={{ padding:12, display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(150px,1fr))", gap:8 }}>
                   {selected.attachments.map((att,i)=>{
                     const sel = attachSel.has(i);
-                    const ext = att.name.split(".").pop().toLowerCase();
-                    const ic  = ext==="pdf"?"📕":ext==="pptx"||ext==="ppt"?"📊":ext==="docx"||ext==="doc"?"📝":ext==="xlsx"||ext==="xls"?"📈":"📎";
                     return (
                       <div key={i} onClick={()=>{ const s=new Set(attachSel); sel?s.delete(i):s.add(i); setAttachSel(s); }}
                         style={{ border:`1.5px solid ${sel?G.lime:G.ink4}`, borderRadius:8, padding:10, cursor:"pointer",
-                          background: sel?`${G.lime}08`:G.ink3, transition:"all .18s", position:"relative" }}>
+                          background:sel?`${G.lime}08`:G.ink3, position:"relative" }}>
                         <div style={{ position:"absolute", top:6, right:6, width:16, height:16, borderRadius:4,
-                          background:sel?G.lime:G.ink4, display:"flex", alignItems:"center", justifyContent:"center", fontSize:10, color:sel?G.ink:"transparent" }}>✓</div>
-                        <div style={{ fontSize:22, marginBottom:6 }}>{ic}</div>
+                          background:sel?G.lime:G.ink4, display:"flex", alignItems:"center", justifyContent:"center",
+                          fontSize:10, color:sel?G.ink:"transparent" }}>✓</div>
+                        <div style={{ fontSize:20, marginBottom:5 }}>{fileIcon(att.name)}</div>
                         <div style={{ fontSize:10, fontWeight:600, lineHeight:1.4, paddingRight:20 }}>{att.name}</div>
-                        <div style={{ fontSize:9, color:G.mist, fontFamily:"monospace", marginTop:3 }}>{att.size}</div>
+                        {att.size && <div style={{ fontSize:9, color:G.mist, marginTop:2 }}>{att.size}</div>}
                       </div>
                     );
                   })}
                 </div>
+                {/* Upload real files for those attachments */}
+                <div style={{ padding:"0 12px 12px" }}>
+                  <DropZone compact onFiles={handleAttachFiles} />
+                  {fileExtracting && <div style={{ display:"flex", gap:8, alignItems:"center", marginTop:8, fontSize:12, color:G.lime }}><Dots/> Extraction fichiers…</div>}
+                  {Object.keys(fileContents).length>0 && (
+                    <div style={{ fontSize:11, color:G.mint, marginTop:6 }}>
+                      ✓ {Object.keys(fileContents).length} fichier(s) extrait(s) et intégrés à l'analyse
+                    </div>
+                  )}
+                </div>
               </div>
             )}
 
-            {/* AI Extract result */}
+            {/* AI Extract status + form */}
             {extracting && (
-              <div style={{ display:"flex", alignItems:"center", gap:10, background:G.ink2, border:`1px solid ${G.lime}33`, borderRadius:10, padding:12, fontSize:12, color:G.lime }}>
-                <Dots /> Extracting company information with AI…
+              <div style={{ display:"flex", alignItems:"center", gap:10, background:G.ink2,
+                border:`1px solid ${G.lime}33`, borderRadius:10, padding:12, fontSize:12, color:G.lime }}>
+                <Dots/> Extraction IA en cours…
               </div>
             )}
             {extracted && !extracting && (
               <ExtractForm extracted={extracted} setExtracted={setExtracted}
-                senderRole={senderRole} setSenderRole={setSenderRole}
-                onImport={doImport} />
+                senderRole={senderRole} setSenderRole={setSenderRole} onImport={doImport} />
             )}
           </div>
         )}
@@ -781,294 +822,394 @@ function EmailImportView({ onImport, showToast }) {
   );
 }
 
-// ─── EXTRACTED FORM ───────────────────────────────────────────────────────────
+// ─── EXTRACT FORM ─────────────────────────────────────────────────────────────
 function ExtractForm({ extracted, setExtracted, onImport }) {
-  const Field = ({ label, fkey, type="text", isSelect, options }) => (
-    <div>
-      <label style={{ fontSize:9, fontFamily:"monospace", textTransform:"uppercase", letterSpacing:".8px", color:G.mist, display:"flex", alignItems:"center", gap:6, marginBottom:5 }}>
-        {label}
-        <span style={{ fontSize:9, padding:"1px 6px", borderRadius:10, background:`${G.lime}18`, color:G.lime, border:`1px solid ${G.lime}33` }}>AI</span>
-      </label>
-      {isSelect
-        ? <select value={extracted[fkey]||""} onChange={e=>setExtracted({...extracted,[fkey]:e.target.value})}
-            style={{ background:G.ink3, border:`1px solid ${G.ink4}`, borderRadius:8, color:G.paper, fontSize:12, padding:"8px 12px", width:"100%", fontFamily:"inherit", outline:"none" }}>
-            {options.map(o=><option key={o}>{o}</option>)}
-          </select>
-        : <input type={type} value={extracted[fkey]||""} onChange={e=>setExtracted({...extracted,[fkey]:e.target.value})}
-            style={{ background:G.ink3, border:`1px solid ${G.ink4}`, borderRadius:8, color:G.paper, fontSize:12, padding:"8px 12px", width:"100%", fontFamily:"inherit", outline:"none" }} />
-      }
-    </div>
-  );
-
+  const set = (k,v) => setExtracted(p=>({...p,[k]:v}));
   return (
     <div style={{ background:G.ink2, border:`1px solid ${G.lime}33`, borderRadius:12, overflow:"hidden" }}>
       <div style={{ padding:"10px 14px", borderBottom:`1px solid ${G.ink4}`, display:"flex", alignItems:"center", gap:8 }}>
-        <span style={{ color:G.lime, fontSize:15 }}>✨</span>
-        <span style={{ fontSize:11, fontFamily:"monospace", textTransform:"uppercase", letterSpacing:".8px", color:G.mist, flex:1 }}>AI-Extracted Company Info — review & edit</span>
+        <span style={{ color:G.lime }}>✨</span>
+        <span style={{ fontSize:11, fontFamily:"monospace", textTransform:"uppercase", letterSpacing:".8px", color:G.mist, flex:1 }}>Infos extraites par l'IA — vérifier et modifier</span>
       </div>
-      <div style={{ padding:16, display:"flex", flexDirection:"column", gap:12 }}>
+      <div style={{ padding:16, display:"flex", flexDirection:"column", gap:10 }}>
         <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
-          <Field label="Company Name" fkey="name" />
-          <Field label="Website" fkey="website" type="url" />
+          <Input label="Nom de l'entreprise *" value={extracted.name} onChange={v=>set("name",v)} />
+          <Input label="Site web" value={extracted.website} onChange={v=>set("website",v)} type="url" />
         </div>
         <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
-          <Field label="Sector" fkey="sector" isSelect options={SECTORS} />
-          <Field label="Stage"  fkey="stage"  isSelect options={STAGES}  />
+          <Select label="Secteur" value={extracted.sector} onChange={v=>set("sector",v)}
+            options={["",  ...SECTORS].map(s=>({value:s,label:s||"Sélectionner…"}))} />
+          <Select label="Stade" value={extracted.stage} onChange={v=>set("stage",v)}
+            options={STAGES} />
         </div>
         <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
-          <Field label="Location" fkey="location" />
-          <Field label="Founded"  fkey="year" />
+          <Input label="Localisation" value={extracted.location} onChange={v=>set("location",v)} />
+          <Input label="Fondée en" value={extracted.year} onChange={v=>set("year",v)} />
         </div>
         <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
-          <Field label="Raising" fkey="raisingAmount" />
-          <Field label="ARR"     fkey="arr" />
+          <Input label="Levée recherchée" value={extracted.raisingAmount} onChange={v=>set("raisingAmount",v)} />
+          <Input label="ARR actuel" value={extracted.arr} onChange={v=>set("arr",v)} />
         </div>
         <div>
           <label style={{ fontSize:9, fontFamily:"monospace", textTransform:"uppercase", letterSpacing:".8px", color:G.mist, marginBottom:5, display:"block" }}>Description</label>
-          <textarea value={extracted.description||""} onChange={e=>setExtracted({...extracted,description:e.target.value})}
-            style={{ background:G.ink3, border:`1px solid ${G.ink4}`, borderRadius:8, color:G.paper, fontSize:12, padding:"9px 12px", fontFamily:"inherit", width:"100%", minHeight:80, resize:"vertical", outline:"none" }} />
+          <textarea value={extracted.description||""} onChange={e=>set("description",e.target.value)}
+            style={{ background:G.ink3, border:`1px solid ${G.ink4}`, borderRadius:8, color:G.paper,
+              fontSize:12, padding:"9px 12px", fontFamily:"inherit", width:"100%", minHeight:80, resize:"vertical", outline:"none" }} />
         </div>
-        {extracted.highlights?.length > 0 && (
+        {extracted.highlights?.length>0 && (
           <div>
-            <div style={{ fontSize:9, fontFamily:"monospace", textTransform:"uppercase", letterSpacing:".8px", color:G.mist, marginBottom:6 }}>Key Highlights</div>
+            <div style={{ fontSize:9, fontFamily:"monospace", textTransform:"uppercase", color:G.mist, marginBottom:6 }}>Points clés</div>
             {extracted.highlights.map((h,i)=>(
               <div key={i} style={{ fontSize:12, color:G.fog, marginBottom:4, display:"flex", gap:7 }}>
-                <span style={{ color:G.lime, fontSize:10, marginTop:3 }}>◆</span>{h}
+                <span style={{ color:G.lime, fontSize:10, marginTop:3, flexShrink:0 }}>◆</span>{h}
               </div>
             ))}
           </div>
         )}
-        <Btn accent onClick={onImport} style={{ justifyContent:"center" }}>✨ Import to Dealflow & Assess with AI</Btn>
+        <Btn accent onClick={onImport} style={{ justifyContent:"center" }}>✨ Importer dans le Dealflow & Analyser</Btn>
       </div>
     </div>
   );
 }
 
-// ─── MAIN APP ─────────────────────────────────────────────────────────────────
+// ─── WORD EXPORT ──────────────────────────────────────────────────────────────
+function exportWord(company) {
+  const lines = [
+    "DEALFLOW OS — MÉMO D'INVESTISSEMENT",
+    "=" .repeat(50),
+    `Entreprise : ${company.name}`,
+    `Secteur : ${company.sector} | Stade : ${company.stage} | Localisation : ${company.location||"—"}`,
+    `Statut : ${(company.status||"").toUpperCase()}`,
+    `Date : ${new Date().toLocaleDateString("fr-FR")}`,
+    "",
+    "CONFIDENTIEL — Pour usage interne VC uniquement.",
+    "Ces données ne doivent pas être utilisées pour l'entraînement de modèles IA.",
+    "",
+    "─".repeat(40),
+    "RÉSUMÉ EXÉCUTIF",
+    "─".repeat(40),
+    company.assessment?.summary || company.description || "",
+    "",
+    ...(company.scores?.overall ? [
+      "─".repeat(40), "SCORES", "─".repeat(40),
+      `Global : ${company.scores.overall}/10  |  Équipe : ${company.scores.team}/10  |  Marché : ${company.scores.market}/10  |  Produit : ${company.scores.product}/10`,
+      "",
+    ] : []),
+    ...(company.assessment?.keyMetrics ? [
+      "─".repeat(40), "MÉTRIQUES CLÉS", "─".repeat(40),
+      ...Object.entries(company.assessment.keyMetrics).map(([k,v])=>`${k} : ${v}`),
+      "",
+    ] : []),
+    ...(company.assessment?.strengths?.length ? [
+      "─".repeat(40), "POINTS FORTS", "─".repeat(40),
+      ...company.assessment.strengths.map(s=>`• ${s}`), "",
+    ] : []),
+    ...(company.assessment?.risks?.length ? [
+      "─".repeat(40), "RISQUES CLÉS", "─".repeat(40),
+      ...company.assessment.risks.map(r=>`• ${r}`), "",
+    ] : []),
+    ...(company.report ? [
+      "─".repeat(40), "MÉMO COMPLET", "─".repeat(40),
+      company.report, "",
+    ] : []),
+    ...(company.news?.length ? [
+      "─".repeat(40), "ACTUALITÉS RÉCENTES", "─".repeat(40),
+      ...company.news.map(n=>`${n.date}  ${n.title}`), "",
+    ] : []),
+    ...(company.notes?.length ? [
+      "─".repeat(40), "NOTES ANALYSTE", "─".repeat(40),
+      ...company.notes.map(n=>`[${new Date(n.date).toLocaleDateString("fr-FR")}] ${n.text}`), "",
+    ] : []),
+    ...(company.sourceEmail ? [
+      "─".repeat(40), "SOURCE", "─".repeat(40),
+      `De : ${company.sourceEmail.from} <${company.sourceEmail.fromEmail}>`,
+      `Rôle : ${company.sourceEmail.role}`,
+      `Objet : ${company.sourceEmail.subject||"—"}`,
+      "",
+    ] : []),
+    "─".repeat(50),
+    "CONFIDENTIEL — Dealflow OS — Ne pas distribuer.",
+  ];
+  const blob = new Blob([lines.join("\n")], { type:"application/msword" });
+  const a    = Object.assign(document.createElement("a"), { href:URL.createObjectURL(blob), download:`${company.name.replace(/\s+/g,"_")}_Memo.doc` });
+  a.click(); URL.revokeObjectURL(a.href);
+}
+
+// ─── AI FUNCTIONS ─────────────────────────────────────────────────────────────
+async function assessCompany(company) {
+  const ctx = [
+    `Nom : ${company.name}`,
+    `Secteur : ${company.sector}`,
+    `Stade : ${company.stage}`,
+    company.location ? `Localisation : ${company.location}` : "",
+    company.year     ? `Fondée en : ${company.year}` : "",
+    company.description ? `Description : ${company.description.slice(0,800)}` : "",
+    company.raising  ? `Levée : ${company.raising}` : "",
+    company.arr      ? `ARR : ${company.arr}` : "",
+  ].filter(Boolean).join("\n");
+
+  return callClaudeJSON(
+    `Analyse cette startup pour un investissement VC :\n\n${ctx}\n\n
+Retourne un objet JSON avec exactement ces champs :
+{
+  "summary": "résumé 3 phrases — thèse d'investissement et points saillants",
+  "strengths": ["force 1", "force 2", "force 3"],
+  "risks": ["risque 1", "risque 2", "risque 3"],
+  "teamScore": <entier 1-10>,
+  "marketScore": <entier 1-10>,
+  "productScore": <entier 1-10>,
+  "overallScore": <entier 1-10>,
+  "recommendation": "Pass|Watch|Invest",
+  "keyMetrics": { "TAM": "$XB", "ARR": "valeur ou N/A", "Géographie": "région" },
+  "tags": ["tag1", "tag2", "tag3"]
+}`,
+    "Tu es un analyste VC senior. Évalue objectivement cette startup."
+  );
+}
+
+async function fetchNewsForCompany(company) {
+  return callClaudeJSON(
+    `Génère 4 actualités récentes plausibles pour la startup "${company.name}" dans le secteur ${company.sector} (${company.stage}).
+Retourne UNIQUEMENT un tableau JSON : [{"date":"AAAA-MM-JJ","title":"titre de l'actualité"},...]`,
+    "Génère des actualités réalistes et pertinentes pour un analyste VC."
+  );
+}
+
+async function generateReportForCompany(company) {
+  const a = company.assessment || {};
+  return callClaude(
+    `Rédige un mémo d'investissement VC structuré pour ${company.name} (${company.sector}, ${company.stage}, statut : ${company.status}).
+${company.description ? `Description : ${company.description.slice(0,600)}` : ""}
+Scores : Équipe ${company.scores?.team}/10, Marché ${company.scores?.market}/10, Produit ${company.scores?.product}/10, Global ${company.scores?.overall}/10.
+${a.summary || ""}
+Forces : ${(a.strengths||[]).join(", ")}.
+Risques : ${(a.risks||[]).join(", ")}.
+Actualités : ${(company.news||[]).map(n=>n.title).join("; ")}.
+
+Structure du mémo : Résumé Exécutif | Opportunité Marché | Produit & Technologie | Équipe | Thèse d'Investissement | Risques Clés | Recommandation.`,
+    "Tu es un associé VC senior rédigeant un mémo pour le comité d'investissement. Sois structuré, précis et concis.",
+    { maxTokens: 1400 }
+  );
+}
+
+// ─── MAIN APPLICATION ─────────────────────────────────────────────────────────
 export default function App() {
-  const [companies,  setCompanies]  = useState(loadSaved);
-  const [view,       setView]       = useState("dashboard");
-  const [panelId,    setPanelId]    = useState(null);
-  const [toastMsg,   setToastMsg]   = useState("");
-  const [toastVis,   setToastVis]   = useState(false);
-  const [cmpSel,     setCmpSel]     = useState([]);
-  const [cmpResult,  setCmpResult]  = useState(null);
-  const [cmpLoading, setCmpLoading] = useState(false);
-  const [opps,       setOpps]       = useState([]);
-  const [oppsLoading,setOppsLoading]= useState(false);
-  const [aiQuery,    setAiQuery]    = useState("");
-  const [aiAnswer,   setAiAnswer]   = useState("");
-  const [aiLoading,  setAiLoading]  = useState(false);
-  const [addForm,    setAddForm]    = useState({ name:"",url:"",sector:"",stage:"Seed",location:"",year:"",description:"" });
-  const [openReports,setOpenReports]= useState({});
+  const [companies,   setCompanies]  = useState(restore);
+  const [view,        setView]       = useState("dashboard");
+  const [panelId,     setPanelId]    = useState(null);
+  const [toast,       setToast]      = useState({ msg:"", visible:false });
+  const [cmpSel,      setCmpSel]     = useState([]);
+  const [cmpResult,   setCmpResult]  = useState(null);
+  const [cmpLoading,  setCmpLoading] = useState(false);
+  const [opps,        setOpps]       = useState([]);
+  const [oppsLoading, setOppsLoading]= useState(false);
+  const [aiQ,         setAiQ]        = useState("");
+  const [aiA,         setAiA]        = useState("");
+  const [aiLoading,   setAiLoading]  = useState(false);
+  const [openReports, setOpenReports]= useState({});
+  const [addForm,     setAddForm]    = useState({ name:"",url:"",sector:"",stage:"Seed",location:"",year:"",description:"" });
+  const [addLoading,  setAddLoading] = useState(false);
 
   const panel = companies.find(c=>c.id===panelId);
 
-  function showToast(msg) {
-    setToastMsg(msg); setToastVis(true);
-    setTimeout(()=>setToastVis(false), 2800);
-  }
+  const showToast = useCallback((msg) => {
+    setToast({ msg, visible:true });
+    setTimeout(()=>setToast(t=>({...t,visible:false})), 2800);
+  }, []);
 
-  function mutate(id, patch) {
-    setCompanies(prev => { const next = prev.map(c=>c.id===id?{...c,...patch}:c); save(next); return next; });
-  }
+  const mutate = useCallback((id, patch) => {
+    setCompanies(prev => {
+      const next = prev.map(c=>c.id===id?{...c,...patch}:c);
+      persist(next);
+      return next;
+    });
+  }, []);
 
-  // ── AI ASSESS ──
-  async function assess(id) {
-    const c = companies.find(x=>x.id===id); if(!c) return;
-    const raw = await callClaudeJSON(
-      `Assess for VC: Name: ${c.name}, Sector: ${c.sector}, Stage: ${c.stage}${c.description?", Desc: "+c.description.slice(0,600):""}${c.location?", Location: "+c.location:""}${c.year?", Founded: "+c.year:""}.
-Return JSON: {"summary":"3 sentences","strengths":["s1","s2","s3"],"risks":["r1","r2","r3"],"teamScore":1-10,"marketScore":1-10,"productScore":1-10,"overallScore":1-10,"recommendation":"Pass|Watch|Invest","keyMetrics":{"TAM":"$XB","ARR":"value or N/A","Geography":"region"},"tags":["tag1","tag2","tag3"]}`,
-      "You are a senior VC analyst. Assess this startup objectively."
-    );
-    if (raw) {
-      mutate(id, {
-        assessment: raw,
-        scores: { team:raw.teamScore, market:raw.marketScore, product:raw.productScore, overall:raw.overallScore },
-        tags: raw.tags||[],
-        lastUpdated: new Date().toISOString(),
-      });
+  const pushCompany = useCallback((company) => {
+    setCompanies(prev => { const next=[company,...prev]; persist(next); return next; });
+  }, []);
+
+  // Run AI assessment and update company
+  const runAssess = useCallback(async (id) => {
+    const c = companies.find(x=>x.id===id);
+    if (!c) return;
+    try {
+      const result = await assessCompany(c);
+      if (result) {
+        mutate(id, {
+          assessment: result,
+          scores: { team:result.teamScore, market:result.marketScore, product:result.productScore, overall:result.overallScore },
+          tags:   result.tags || [],
+          lastUpdated: new Date().toISOString(),
+        });
+      }
+    } catch (err) {
+      console.error("Assessment error:", err);
+      showToast("Erreur lors de l'analyse — vérifiez la clé API dans Vercel");
     }
-  }
+  }, [companies, mutate, showToast]);
 
-  async function fetchNews(id) {
-    const c = companies.find(x=>x.id===id); if(!c) return;
-    const raw = await callClaudeJSON(
-      `Generate 4 plausible recent news items for startup "${c.name}" in ${c.sector} (${c.stage}). Return ONLY a JSON array: [{"date":"YYYY-MM-DD","title":"headline"},...]`,
-      "Return ONLY valid JSON array."
-    );
-    if (Array.isArray(raw)) mutate(id, { news: raw });
-  }
+  // Import from email view
+  const importCompany = useCallback((company) => {
+    pushCompany(company);
+    setView("pipeline");
+    showToast(`"${company.name}" ajouté au Dealflow`);
+    // Assess asynchronously
+    setTimeout(()=>runAssess(company.id), 500);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pushCompany, showToast]);
 
-  async function genReport(id) {
-    const c = companies.find(x=>x.id===id); if(!c) return;
-    const a = c.assessment||{};
-    const report = await callClaude(
-      `Write a VC investment memo for ${c.name} (${c.sector}, ${c.stage}, status: ${c.status}).
-${c.description||""}
-Scores: Team ${c.scores?.team}/10, Market ${c.scores?.market}/10, Product ${c.scores?.product}/10, Overall ${c.scores?.overall}/10.
-${a.summary||""}
-Strengths: ${(a.strengths||[]).join(", ")}.
-Risks: ${(a.risks||[]).join(", ")}.
-News: ${(c.news||[]).map(n=>n.title).join("; ")}.
-Write a structured memo: Executive Summary | Market Opportunity | Product & Tech | Team | Investment Thesis | Key Risks | Recommendation.`,
-      "You are a senior VC partner writing a formal investment committee memo. Be structured and concise.",
-      { maxTokens: 1200 }
-    );
-    mutate(id, { report, reportDate: new Date().toISOString() });
-    setView("reports");
-  }
-
-  function handleRefresh(type) {
+  // Panel actions
+  const handleAction = useCallback(async (action) => {
     if (!panelId) return;
-    if (type==="assess") { mutate(panelId,{assessment:null,scores:null}); assess(panelId); showToast("Re-assessing…"); }
-    if (type==="news")   { fetchNews(panelId); showToast("Fetching news…"); }
-    if (type==="report") { showToast("Generating report…"); genReport(panelId); }
-  }
+    const c = companies.find(x=>x.id===panelId);
+    if (!c) return;
+    if (action==="reassess") {
+      mutate(panelId, { assessment:null, scores:null });
+      showToast("Ré-analyse en cours…");
+      await runAssess(panelId);
+      showToast("Analyse terminée");
+    }
+    if (action==="news") {
+      showToast("Recherche d'actualités…");
+      const news = await fetchNewsForCompany(c);
+      if (Array.isArray(news)) { mutate(panelId, { news }); showToast("Actualités mises à jour"); }
+    }
+    if (action==="report") {
+      showToast("Génération du rapport…");
+      const report = await generateReportForCompany(c);
+      if (report) { mutate(panelId, { report, reportDate:new Date().toISOString() }); setView("reports"); showToast("Rapport généré"); }
+    }
+    if (action==="export") { exportWord(c); showToast("Téléchargement en cours…"); }
+  }, [panelId, companies, mutate, showToast, runAssess]);
 
-  function addCompany() {
-    if (!addForm.name.trim()) { showToast("Company name required"); return; }
-    const c = { id:uid(), ...addForm, sector:addForm.sector||"Other",
+  // Add company manually
+  const addCompany = async () => {
+    if (!addForm.name.trim()) { showToast("Nom de l'entreprise requis"); return; }
+    setAddLoading(true);
+    const company = {
+      id:uid(), ...addForm, sector:addForm.sector||"Other",
       status:"dealflow", addedAt:new Date().toISOString(), source:"manual",
-      assessment:null, scores:null, news:[], notes:[], tags:[] };
-    const next = [c, ...companies];
-    setCompanies(next); save(next);
+      assessment:null, scores:null, news:[], notes:[], tags:[],
+    };
+    pushCompany(company);
     setAddForm({ name:"",url:"",sector:"",stage:"Seed",location:"",year:"",description:"" });
-    showToast(`"${c.name}" added`);
+    showToast(`"${company.name}" ajouté`);
     setView("pipeline");
-    assess(c.id);
-  }
+    await runAssess(company.id);
+    setAddLoading(false);
+  };
 
-  function importCompany(company) {
-    const next = [company, ...companies];
-    setCompanies(next); save(next);
+  // Add with file upload
+  const addWithFiles = async (files) => {
+    setAddLoading(true);
+    showToast("Extraction des fichiers…");
+    let combined = "";
+    const fileList = [];
+    for (const file of files) {
+      try {
+        const r = await extractFileContent(file);
+        combined += `\n\n[${file.name}]\n${r.content}`;
+        fileList.push({ name:file.name, size:`${(file.size/1024/1024).toFixed(1)} MB` });
+        showToast(`Extrait : ${file.name}`);
+      } catch { showToast(`Erreur : ${file.name}`); }
+    }
+    // Auto-extract company name from content
+    const nameGuess = await callClaudeJSON(
+      `Depuis ce contenu, extrais le nom de la startup et son secteur.\nContenu : ${combined.slice(0,1000)}\nRetourne : {"name":"nom","sector":"secteur"}`,
+      "Extrait structuré."
+    );
+    const company = {
+      id:uid(), name:nameGuess?.name||files[0]?.name||"Startup",
+      sector:nameGuess?.sector||"Other", stage:"Seed", location:"", year:"",
+      description:combined.slice(0,3000), url:"", raising:"", arr:"",
+      status:"dealflow", addedAt:new Date().toISOString(), source:"upload",
+      files: fileList, assessment:null, scores:null, news:[], notes:[], tags:[],
+    };
+    pushCompany(company);
     setView("pipeline");
-    assess(company.id);
-  }
+    showToast(`"${company.name}" ajouté`);
+    await runAssess(company.id);
+    setAddLoading(false);
+  };
 
-  // ── COMPARE ──
-  async function runCompare() {
-    if (cmpSel.length < 2) { showToast("Select ≥2 companies"); return; }
-    setCmpLoading(true); setCmpResult(null);
-    const sel = companies.filter(c=>cmpSel.includes(c.id));
-    const data = sel.map(c=>`${c.name}: ${c.sector}, ${c.stage}, overall:${c.scores?.overall||"?"} team:${c.scores?.team||"?"} market:${c.scores?.market||"?"} product:${c.scores?.product||"?"}. ${c.assessment?.summary||""}`).join("\n");
-    const res = await callClaudeJSON(
-      `Compare these startups for VC:\n${data}\nReturn JSON: {"narrative":"2-sentence comparative analysis","winner":"best investment opportunity name","dimensions":[{"name":"dimension","values":{"CompanyA":score0-10,"CompanyB":score0-10}}],"conclusion":"recommendation paragraph"}`,
-      "You are a senior VC partner. Compare these companies objectively."
-    );
-    setCmpResult(res); setCmpLoading(false);
-  }
-
-  // ── OPPORTUNITIES ──
-  async function loadOpps() {
-    setOppsLoading(true); setOpps([]);
-    const sectors = [...new Set(companies.map(c=>c.sector))];
-    const res = await callClaudeJSON(
-      `VC portfolio: ${companies.length} companies. Sectors: ${sectors.join(", ")||"none"}. Top companies: ${companies.filter(c=>c.scores?.overall>=7).map(c=>c.name).join(", ")||"none"}.
-Generate 6 strategic insights (mix hot opportunities + coverage gaps). Return JSON array:
-[{"type":"hot","icon":"🚀","title":"title","description":"2 sentences"},{"type":"gap","icon":"⚠️","title":"gap","description":"2 sentences"},...]`,
-      "You are a senior VC strategist. Return ONLY valid JSON array."
-    );
-    if (Array.isArray(res)) setOpps(res);
-    setOppsLoading(false);
-  }
-
-  // ── AI QUERY ──
-  async function runAIQuery() {
-    if (!aiQuery.trim()) return;
-    setAiLoading(true); setAiAnswer("");
-    const ctx = `Portfolio: ${companies.length} companies. ${companies.map(c=>`${c.name}(${c.sector},${c.stage},${c.status},score:${c.scores?.overall||"?"})`).join("; ")}.`;
-    const ans = await callClaude(
-      `Portfolio context: ${ctx}\n\nQuestion: ${aiQuery}`,
-      "You are a senior VC partner with access to this portfolio data. Give sharp, specific, actionable insights."
-    );
-    setAiAnswer(ans); setAiLoading(false);
-  }
+  const counts = { dealflow:0, watch:0, invested:0, dead:0 };
+  companies.forEach(c=>{ if(counts[c.status]!=null) counts[c.status]++; });
 
   // ── DEMO DATA ──
-  function loadDemo() {
+  const loadDemo = () => {
     const demo = [
-      { id:uid(), name:"NeuralPath", sector:"AI / Machine Learning", stage:"Series A", location:"Paris, France", year:"2021", status:"watch", addedAt:new Date(Date.now()-864e5*10).toISOString(), source:"email", description:"Enterprise AI for document intelligence. €2.8M ARR, 52 clients.", sourceEmail:{from:"Sophie Martin",fromEmail:"sophie@neuralpath.ai",role:"founder",subject:"NeuralPath Series A deck",provider:"gmail"},
-        assessment:{summary:"NeuralPath has strong enterprise traction with proprietary models outperforming GPT-4 by 23%. ARR at €2.8M growing 18% MoM with 52 enterprise clients.",strengths:["52 enterprise clients","€2.8M ARR +18% MoM","Proprietary model edge over GPT-4"],risks:["Big tech commoditization","Long enterprise cycles","High burn"],recommendation:"Watch",keyMetrics:{TAM:"$45B",ARR:"€2.8M",NRR:"124%",Growth:"18% MoM"}},
-        scores:{team:8,market:9,product:7,overall:8},tags:["Enterprise AI","Doc Intelligence","B2B SaaS"],
-        news:[{date:"2024-12-01",title:"Closes €8M Series A"},{date:"2024-11-15",title:"Partnership with BNP Paribas"}],notes:[{text:"Strong team. Watch competitive dynamics.",date:new Date().toISOString()}] },
-      { id:uid(), name:"GreenFlow", sector:"CleanTech / Climate", stage:"Seed", location:"Amsterdam, NL", year:"2022", status:"dealflow", addedAt:new Date(Date.now()-864e5*3).toISOString(), source:"email", description:"ESG/CSRD carbon accounting SaaS. €420K ARR.", sourceEmail:{from:"Marc Leblanc",fromEmail:"marc@venturebridge.fr",role:"intermediary",subject:"Intro — GreenFlow",provider:"gmail"},
-        assessment:{summary:"GreenFlow addresses CSRD regulatory mandate with strong automation. Unit economics positive early, though competition from Watershed intensifies.",strengths:["EU regulatory tailwind","80% time reduction","Unit-economics positive"],risks:["Competition from Watershed","Long enterprise cycles","Regulatory risk"],recommendation:"Watch",keyMetrics:{TAM:"$22B",ARR:"€420K",Clients:"12 pilots",Geography:"EU"}},
-        scores:{team:7,market:8,product:6,overall:7},tags:["ESG","Carbon","RegTech"],
-        news:[{date:"2024-11-20",title:"CSRD mandates accelerating demand"}],notes:[] },
-      { id:uid(), name:"MedSync", sector:"HealthTech", stage:"Series A", location:"Lyon, France", year:"2020", status:"invested", addedAt:new Date(Date.now()-864e5*60).toISOString(), source:"manual", description:"AI patient engagement for hospitals. 45% no-show reduction. 15 clients.",
-        assessment:{summary:"MedSync has exceptional PMF with measurable clinical outcomes and sticky multi-year contracts. NRR 121% signals strong expansion.",strengths:["45% no-show reduction proven","Multi-year hospital contracts","NRR 121%"],risks:["Public procurement slowness","EU fragmentation","IT integration complexity"],recommendation:"Invest",keyMetrics:{TAM:"$8B Europe",ARR:"€2.2M",NRR:"121%",Clients:"15 hospitals"}},
-        scores:{team:9,market:7,product:8,overall:8},tags:["HealthTech","AI","Hospital"],
-        news:[{date:"2024-12-05",title:"Signs €2.1M contract with AP-HP"},{date:"2024-11-01",title:"Belgium expansion announced"}],notes:[{text:"Portfolio company — invested €750K at €6M pre. Executing very well.",date:new Date().toISOString()}] },
-      { id:uid(), name:"QuantumPay", sector:"FinTech", stage:"Seed", location:"Berlin, Germany", year:"2023", status:"dealflow", addedAt:new Date(Date.now()-864e5*2).toISOString(), source:"email", description:"Quantum-resistant payment orchestration for European banks.", sourceEmail:{from:"Thomas Keller",fromEmail:"thomas@quantumpay.io",role:"founder",subject:"QuantumPay follow-up",provider:"gmail"},
-        assessment:{summary:"QuantumPay is an ahead-of-curve bet on quantum-resistant payments infrastructure. Team has deep credentials but market timing risk is real.",strengths:["Ex-Stripe CTO + Deutsche Bank","ING + Deutsche Bank pilots","Unique technical moat"],risks:["Market timing (5-10yr horizon)","Long banking sales cycles","Regulatory complexity"],recommendation:"Watch",keyMetrics:{TAM:"$180B payments",ARR:"€0 (pilots)",Raising:"€4M Seed"}},
-        scores:{team:8,market:7,product:6,overall:7},tags:["FinTech","Quantum","Security"],
-        news:[{date:"2024-12-03",title:"Raises €1.5M pre-seed from Speedinvest"}],notes:[] },
+      { id:uid(), name:"NeuralPath", sector:"AI / Machine Learning", stage:"Series A",
+        location:"Paris, France", year:"2021", status:"watch", source:"email",
+        addedAt:new Date(Date.now()-864e5*10).toISOString(), description:"Enterprise AI pour document intelligence. €2,8M ARR, 52 clients.",
+        sourceEmail:{ from:"Sophie Martin", fromEmail:"sophie@neuralpath.ai", role:"founder", provider:"gmail" },
+        assessment:{ summary:"NeuralPath a une traction entreprise solide avec des modèles propriétaires surpassant GPT-4 de 23%. L'ARR à €2,8M croît de 18% MoM avec 52 clients grands comptes.", strengths:["52 clients entreprise","€2,8M ARR +18% MoM","Avantage modèle propriétaire vs GPT-4"], risks:["Risque commoditisation big tech","Cycles de vente longs (6-9 mois)","Burn élevé en expansion"], recommendation:"Watch", keyMetrics:{ TAM:"$45B", ARR:"€2,8M", NRR:"124%", Croissance:"18% MoM" } },
+        scores:{ team:8, market:9, product:7, overall:8 },
+        tags:["Enterprise AI","Document Intelligence","B2B SaaS"],
+        news:[{ date:"2024-12-01", title:"Fermeture Series A €8M" },{ date:"2024-11-15", title:"Partenariat BNP Paribas signé" }],
+        notes:[{ text:"Équipe solide. Surveiller la dynamique concurrentielle.", date:new Date().toISOString() }] },
+      { id:uid(), name:"GreenFlow", sector:"CleanTech / Climate", stage:"Seed",
+        location:"Amsterdam, NL", year:"2022", status:"dealflow", source:"email",
+        addedAt:new Date(Date.now()-864e5*3).toISOString(), description:"SaaS comptabilité carbone CSRD. €420K ARR.",
+        sourceEmail:{ from:"Marc Leblanc", fromEmail:"marc@venturebridge.fr", role:"intermediary", provider:"gmail" },
+        assessment:{ summary:"GreenFlow cible le marché réglementaire CSRD avec de forts vents favorables. L'approche automatisée réduit considérablement le temps de reporting.", strengths:["Fort vent réglementaire EU","80% de gain de temps","Économies unitaires positives"], risks:["Concurrence de Watershed/Persefoni","Risque réglementaire post-2025","Cycles longs"], recommendation:"Watch", keyMetrics:{ TAM:"$22B", ARR:"€420K", Clients:"12 pilotes" } },
+        scores:{ team:7, market:8, product:6, overall:7 },
+        tags:["ESG","Carbon","RegTech"], news:[], notes:[] },
+      { id:uid(), name:"MedSync", sector:"HealthTech", stage:"Series A",
+        location:"Lyon, France", year:"2020", status:"invested", source:"manual",
+        addedAt:new Date(Date.now()-864e5*60).toISOString(), description:"Engagement patient IA. Réduction no-show 45%.",
+        assessment:{ summary:"MedSync a atteint un fort product-market fit avec des résultats cliniques mesurables et des contrats hospitaliers multi-annuels. NRR 121%.", strengths:["45% réduction no-show prouvée","Contrats multi-annuels (rétention forte)","NRR 121%"], risks:["Lenteur marchés publics","Fragmentation EU","Intégration SI hospitaliers"], recommendation:"Invest", keyMetrics:{ TAM:"$8B Europe", ARR:"€2,2M", NRR:"121%", Clients:"15 hôpitaux" } },
+        scores:{ team:9, market:7, product:8, overall:8 },
+        tags:["HealthTech","IA","Hôpital"],
+        news:[{ date:"2024-12-05", title:"Contrat €2,1M signé avec AP-HP" }],
+        notes:[{ text:"Portefeuille — investi €750K à €6M pre. Exécution excellente.", date:new Date().toISOString() }] },
     ];
-    const next = demo;
-    setCompanies(next); save(next);
-    showToast("4 demo companies loaded");
+    setCompanies(demo); persist(demo);
+    showToast("3 entreprises démo chargées");
     setView("pipeline");
-  }
+  };
 
-  // ── COUNTS ──
-  const counts = { dealflow:0, watch:0, invested:0, dead:0 };
-  companies.forEach(c=>{ if(counts[c.status]!==undefined) counts[c.status]++; });
-  const total = companies.length;
-  const conv  = total ? Math.round(counts.invested/(total-counts.dead||1)*100) : 0;
+  // ── VIEWS ──────────────────────────────────────────────────────────────────
 
-  // ─── VIEWS ─────────────────────────────────────────────────────────────────
-
-  // DASHBOARD
   const DashView = () => {
-    const recent = companies.slice().sort((a,b)=>new Date(b.addedAt)-new Date(a.addedAt)).slice(0,4);
-    const top    = companies.slice().sort((a,b)=>(b.scores?.overall||0)-(a.scores?.overall||0)).slice(0,4);
-    const secMap = {}; companies.forEach(c=>{ secMap[c.sector]=(secMap[c.sector]||0)+1; });
+    const recent = [...companies].sort((a,b)=>new Date(b.addedAt)-new Date(a.addedAt)).slice(0,4);
+    const top    = [...companies].sort((a,b)=>(b.scores?.overall||0)-(a.scores?.overall||0)).slice(0,4);
+    const secMap = {}; companies.forEach(c=>{secMap[c.sector]=(secMap[c.sector]||0)+1;});
+    const conv   = companies.length ? Math.round(counts.invested/(companies.length-counts.dead||1)*100) : 0;
     return (
       <div>
-        {/* Stats */}
         <div style={{ display:"grid", gridTemplateColumns:"repeat(5,1fr)", gap:10, marginBottom:20 }}>
-          {[
-            ["Total", total, G.lime, "All tracked"],
-            ["Dealflow", counts.dealflow, G.sky, "In review"],
-            ["Watching", counts.watch, G.gold, "Due diligence"],
-            ["Invested", counts.invested, G.mint, `${conv}% conv.`],
-            ["Passed", counts.dead, G.rose, "Closed"],
-          ].map(([label, val, col, sub])=>(
-            <div key={label} style={{ background:G.ink2, border:`1px solid ${G.ink4}`, borderRadius:12, padding:"14px 16px", position:"relative", overflow:"hidden" }}>
+          {[["Total",companies.length,G.lime,"Suivies"],["Dealflow",counts.dealflow,G.sky,"En revue"],["Watching",counts.watch,G.gold,"Due diligence"],["Investies",counts.invested,G.mint,`${conv}% conv.`],["Passées",counts.dead,G.rose,"Fermées"]].map(([l,v,col,sub])=>(
+            <div key={l} style={{ background:G.ink2, border:`1px solid ${G.ink4}`, borderRadius:12, padding:"14px 16px", position:"relative", overflow:"hidden" }}>
               <div style={{ position:"absolute", top:0, right:0, width:60, height:60, borderRadius:"50%", background:col, opacity:.08, transform:"translate(20px,-20px)" }} />
-              <div style={{ fontSize:26, fontWeight:800, color:col, letterSpacing:-1, marginBottom:3 }}>{val}</div>
-              <div style={{ fontSize:10, fontFamily:"monospace", color:G.mist, textTransform:"uppercase", letterSpacing:".8px" }}>{label}</div>
+              <div style={{ fontSize:26, fontWeight:800, color:col, letterSpacing:-1, marginBottom:3 }}>{v}</div>
+              <div style={{ fontSize:10, fontFamily:"monospace", color:G.mist, textTransform:"uppercase", letterSpacing:".8px" }}>{l}</div>
               <div style={{ fontSize:10, color:G.mist, marginTop:4 }}>{sub}</div>
             </div>
           ))}
         </div>
         <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:16, marginBottom:16 }}>
-          {[["Recent", recent], ["Top Scored", top]].map(([title, list])=>(
+          {[["Ajouts récents",recent],["Mieux notées",top.filter(c=>c.scores?.overall)]].map(([title,list])=>(
             <div key={title}>
               <div style={{ fontSize:11, fontFamily:"monospace", textTransform:"uppercase", letterSpacing:".8px", color:G.mist, marginBottom:10 }}>{title}</div>
-              <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
-                {list.filter(c=>title==="Top Scored"?c.scores?.overall:true).map(c=>(
-                  <div key={c.id} onClick={()=>setPanelId(c.id)}
-                    style={{ display:"flex", alignItems:"center", gap:10, background:G.ink3, border:`1px solid ${G.ink4}`, borderRadius:8, padding:"9px 12px", cursor:"pointer" }}
-                    onMouseOver={e=>e.currentTarget.style.borderColor=G.ink5}
-                    onMouseOut={e=>e.currentTarget.style.borderColor=G.ink4}>
-                    <Avatar name={c.name} size={28} />
-                    <div style={{ flex:1, minWidth:0 }}>
-                      <div style={{ fontSize:12, fontWeight:700, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{c.name}</div>
-                      <div style={{ fontSize:9, color:G.mist, fontFamily:"monospace" }}>{c.sector} · {c.status}</div>
-                    </div>
-                    {c.scores?.overall
-                      ? <div style={{ fontSize:14, fontWeight:800, color:scoreCol(c.scores.overall) }}>{c.scores.overall}</div>
-                      : <Spinner />}
+              {list.length===0 && <div style={{ fontSize:12, color:G.mist }}>Aucune entreprise.</div>}
+              {list.map(c=>(
+                <div key={c.id} onClick={()=>setPanelId(c.id)}
+                  style={{ display:"flex", alignItems:"center", gap:10, background:G.ink3, border:`1px solid ${G.ink4}`, borderRadius:8, padding:"9px 12px", cursor:"pointer", marginBottom:7 }}
+                  onMouseOver={e=>e.currentTarget.style.borderColor=G.ink5}
+                  onMouseOut={e=>e.currentTarget.style.borderColor=G.ink4}>
+                  <Avatar name={c.name} size={28} />
+                  <div style={{ flex:1, minWidth:0 }}>
+                    <div style={{ fontSize:12, fontWeight:700, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{c.name}</div>
+                    <div style={{ fontSize:9, color:G.mist, fontFamily:"monospace" }}>{c.sector} · {c.status}</div>
                   </div>
-                ))}
-                {list.length===0 && <div style={{ fontSize:12, color:G.mist }}>No companies yet.</div>}
-              </div>
+                  {c.scores?.overall ? <div style={{ fontSize:14, fontWeight:800, color:scCol(c.scores.overall) }}>{c.scores.overall}</div> : <Spin/>}
+                </div>
+              ))}
             </div>
           ))}
         </div>
-        <div style={{ fontSize:11, fontFamily:"monospace", textTransform:"uppercase", letterSpacing:".8px", color:G.mist, marginBottom:10 }}>Sector Coverage</div>
+        <div style={{ fontSize:11, fontFamily:"monospace", textTransform:"uppercase", letterSpacing:".8px", color:G.mist, marginBottom:10 }}>Couverture sectorielle</div>
         <div style={{ display:"flex", flexWrap:"wrap", gap:8 }}>
           {Object.entries(secMap).sort((a,b)=>b[1]-a[1]).map(([s,n])=>(
             <span key={s} onClick={()=>setView("sectors")}
@@ -1076,22 +1217,16 @@ Generate 6 strategic insights (mix hot opportunities + coverage gaps). Return JS
               {s} <span style={{ color:G.mist }}>{n}</span>
             </span>
           ))}
-          {Object.keys(secMap).length===0 && <span style={{ fontSize:12, color:G.mist }}>No data yet.</span>}
+          {!Object.keys(secMap).length && <span style={{ fontSize:12, color:G.mist }}>Aucune donnée.</span>}
         </div>
       </div>
     );
   };
 
-  // PIPELINE
   const PipelineView = () => {
-    const cols = [
-      ["dealflow","Dealflow",G.sky],
-      ["watch","Watching",G.gold],
-      ["invested","Invested",G.mint],
-      ["dead","Dead",G.rose],
-    ];
+    const cols = [["dealflow","Dealflow",G.sky],["watch","Watching",G.gold],["invested","Investies",G.mint],["dead","Passées",G.rose]];
     return (
-      <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:12, minHeight:"60vh" }}>
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:12 }}>
         {cols.map(([status,label,col])=>(
           <div key={status} style={{ background:G.ink2, border:`1px solid ${G.ink4}`, borderRadius:14, overflow:"hidden" }}>
             <div style={{ padding:"11px 14px", borderBottom:`1px solid ${G.ink4}`, display:"flex", alignItems:"center", gap:8 }}>
@@ -1112,115 +1247,112 @@ Generate 6 strategic insights (mix hot opportunities + coverage gaps). Return JS
     );
   };
 
-  // SECTORS
   const SectorsView = () => {
-    const sm = {}; companies.forEach(c=>{ if(!sm[c.sector]) sm[c.sector]={count:0,invested:0}; sm[c.sector].count++; if(c.status==="invested")sm[c.sector].invested++; });
-    const max = Math.max(...Object.values(sm).map(v=>v.count), 1);
-    const icons = {"AI / Machine Learning":"🧠","FinTech":"💳","HealthTech":"🏥","CleanTech / Climate":"🌱","Developer Tools":"🛠","SaaS / Enterprise":"🏢","DeepTech / Hardware":"⚙️","Consumer":"📱","Marketplace":"🛒","Cybersecurity":"🔐","BioTech":"🧬","SpaceTech":"🚀","Other":"📦"};
+    const sm={};companies.forEach(c=>{if(!sm[c.sector])sm[c.sector]={count:0,invested:0};sm[c.sector].count++;if(c.status==="invested")sm[c.sector].invested++;});
+    const max=Math.max(...Object.values(sm).map(v=>v.count),1);
+    const icons={"AI / Machine Learning":"🧠","FinTech":"💳","HealthTech":"🏥","CleanTech / Climate":"🌱","Developer Tools":"🛠","SaaS / Enterprise":"🏢","DeepTech / Hardware":"⚙️","Consumer":"📱","Marketplace":"🛒","Cybersecurity":"🔐","BioTech":"🧬","SpaceTech":"🚀","Other":"📦"};
     return (
       <div>
-        <div style={{ fontSize:11, color:G.mist, fontFamily:"monospace", marginBottom:14 }}>
-          {Object.keys(sm).length} sectors · {total} companies tracked
-        </div>
+        <div style={{ fontSize:11,color:G.mist,fontFamily:"monospace",marginBottom:14 }}>{Object.keys(sm).length} secteurs · {companies.length} entreprises</div>
         <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(180px,1fr))", gap:10 }}>
           {Object.entries(sm).sort((a,b)=>b[1].count-a[1].count).map(([s,d])=>(
-            <div key={s} style={{ background:G.ink2, border:`1px solid ${G.ink4}`, borderRadius:12, padding:16, transition:"all .18s" }}
-              onMouseOver={e=>e.currentTarget.style.borderColor=G.ink5}
-              onMouseOut={e=>e.currentTarget.style.borderColor=G.ink4}>
+            <div key={s} style={{ background:G.ink2, border:`1px solid ${G.ink4}`, borderRadius:12, padding:16 }}>
               <div style={{ fontSize:24, marginBottom:8 }}>{icons[s]||"📦"}</div>
               <div style={{ fontSize:13, fontWeight:700, marginBottom:2 }}>{s}</div>
-              <div style={{ fontSize:10, color:G.mist, fontFamily:"monospace", marginBottom:10 }}>{d.count} co · {d.invested} invested</div>
+              <div style={{ fontSize:10, color:G.mist, fontFamily:"monospace", marginBottom:10 }}>{d.count} co · {d.invested} investies</div>
               <div style={{ height:3, background:G.ink4, borderRadius:2, overflow:"hidden" }}>
                 <div style={{ height:"100%", width:`${Math.round(d.count/max*100)}%`, background:G.lime, borderRadius:2 }} />
               </div>
             </div>
           ))}
-          {Object.keys(sm).length===0 && <div style={{ color:G.mist, fontSize:13, gridColumn:"1/-1" }}>No companies yet.</div>}
+          {!Object.keys(sm).length && <div style={{ color:G.mist, fontSize:13 }}>Aucune entreprise.</div>}
         </div>
       </div>
     );
   };
 
-  // COMPARE
   const CompareView = () => (
     <div>
       <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:16, flexWrap:"wrap" }}>
-        <span style={{ fontSize:11, color:G.mist, fontFamily:"monospace" }}>SELECT UP TO 4:</span>
+        <span style={{ fontSize:11, color:G.mist, fontFamily:"monospace" }}>SÉLECTIONNER (max 4) :</span>
         {companies.map(c=>(
-          <button key={c.id} onClick={()=>setCmpSel(prev=>prev.includes(c.id)?prev.filter(x=>x!==c.id):prev.length<4?[...prev,c.id]:prev)}
+          <button key={c.id} onClick={()=>setCmpSel(p=>p.includes(c.id)?p.filter(x=>x!==c.id):p.length<4?[...p,c.id]:p)}
             style={{ fontSize:11, padding:"5px 12px", borderRadius:8, cursor:"pointer", fontFamily:"inherit", fontWeight:600,
               border:`1px solid ${cmpSel.includes(c.id)?G.lime:G.ink4}`,
-              background: cmpSel.includes(c.id)?`${G.lime}18`:G.ink3,
-              color: cmpSel.includes(c.id)?G.lime:G.mist }}>
+              background:cmpSel.includes(c.id)?`${G.lime}18`:G.ink3,
+              color:cmpSel.includes(c.id)?G.lime:G.mist }}>
             {c.name}
           </button>
         ))}
-        <Btn accent onClick={runCompare}>{cmpLoading?<><Spinner/> Comparing…</>:"✨ AI Compare"}</Btn>
+        <Btn accent onClick={async()=>{
+          if(cmpSel.length<2){showToast("Sélectionnez ≥2 entreprises");return;}
+          setCmpLoading(true);setCmpResult(null);
+          const sel=companies.filter(c=>cmpSel.includes(c.id));
+          const d=sel.map(c=>`${c.name}: ${c.sector}, ${c.stage}, global:${c.scores?.overall||"?"} équipe:${c.scores?.team||"?"} marché:${c.scores?.market||"?"} produit:${c.scores?.product||"?"}. ${c.assessment?.summary||""}`).join("\n");
+          const r=await callClaudeJSON(`Compare ces startups pour un investissement VC :\n${d}\nRetourne JSON : {"narrative":"analyse 2 phrases","winner":"meilleure opportunité","dimensions":[{"name":"dimension","values":{"NomA":score,"NomB":score}}],"conclusion":"recommandation"}`, "Analyste VC senior. Compare objectivement.");
+          setCmpResult(r);setCmpLoading(false);
+        }} disabled={cmpLoading}>{cmpLoading?<><Spin/>Comparaison…</>:"✨ Comparer"}</Btn>
       </div>
+      {cmpLoading && <div style={{ display:"flex", gap:8, alignItems:"center", color:G.mist, fontSize:13 }}><Dots/> Génération…</div>}
       {cmpResult && (
         <>
-          <div style={{ background:G.ink2, border:`1px solid ${G.ink4}`, borderRadius:10, padding:14, fontSize:12.5, lineHeight:1.75, color:G.fog, marginBottom:14 }}>
-            {cmpResult.narrative}
-          </div>
+          <div style={{ background:G.ink2, border:`1px solid ${G.ink4}`, borderRadius:10, padding:14, fontSize:12.5, lineHeight:1.75, color:G.fog, marginBottom:14 }}>{cmpResult.narrative}</div>
           <div style={{ overflowX:"auto", marginBottom:14 }}>
             <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12 }}>
-              <thead>
-                <tr>
-                  <th style={{ background:G.ink3, padding:"9px 13px", textAlign:"left", fontSize:9, fontFamily:"monospace", letterSpacing:".8px", color:G.mist, border:`1px solid ${G.ink4}`, textTransform:"uppercase" }}>Dimension</th>
-                  {cmpSel.map(id=>{ const c=companies.find(x=>x.id===id); return (
-                    <th key={id} style={{ background:G.ink3, padding:"9px 13px", textAlign:"left", fontSize:9, fontFamily:"monospace", color:c?.name===cmpResult.winner?G.lime:G.mist, border:`1px solid ${G.ink4}`, textTransform:"uppercase" }}>
-                      {c?.name}{c?.name===cmpResult.winner?" ★":""}
-                    </th>
-                  ); })}
-                </tr>
-              </thead>
+              <thead><tr>
+                <th style={{ background:G.ink3, padding:"9px 13px", textAlign:"left", fontSize:9, fontFamily:"monospace", color:G.mist, border:`1px solid ${G.ink4}`, textTransform:"uppercase" }}>Critère</th>
+                {cmpSel.map(id=>{const c=companies.find(x=>x.id===id);return(
+                  <th key={id} style={{ background:G.ink3, padding:"9px 13px", textAlign:"left", fontSize:9, fontFamily:"monospace", color:c?.name===cmpResult.winner?G.lime:G.mist, border:`1px solid ${G.ink4}`, textTransform:"uppercase" }}>
+                    {c?.name}{c?.name===cmpResult.winner?" ★":""}
+                  </th>
+                );})}
+              </tr></thead>
               <tbody>
                 {(cmpResult.dimensions||[]).map((dim,i)=>(
                   <tr key={i}>
                     <td style={{ padding:"9px 13px", border:`1px solid ${G.ink4}`, color:G.mist, fontSize:10, fontFamily:"monospace", textTransform:"uppercase" }}>{dim.name}</td>
-                    {cmpSel.map(id=>{ const c=companies.find(x=>x.id===id); const v=dim.values?.[c?.name]; const best=v===Math.max(...cmpSel.map(sid=>{ const sc=companies.find(x=>x.id===sid); return dim.values?.[sc?.name]||0; })); return (
+                    {cmpSel.map(id=>{const c=companies.find(x=>x.id===id);const v=dim.values?.[c?.name];const best=v===Math.max(...cmpSel.map(sid=>dim.values?.[companies.find(x=>x.id===sid)?.name]||0));return(
                       <td key={id} style={{ padding:"9px 13px", border:`1px solid ${G.ink4}`, color:best?G.lime:G.fog, fontWeight:best?700:400 }}>{v??"-"}</td>
-                    ); })}
+                    );})}
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
           <div style={{ background:G.ink2, border:`1px solid ${G.ink4}`, borderRadius:10, padding:14, fontSize:12.5, lineHeight:1.75, color:G.fog }}>
-            <span style={{ fontSize:9, fontFamily:"monospace", textTransform:"uppercase", letterSpacing:".8px", color:G.lime }}>Conclusion</span>
-            <p style={{ marginTop:6 }}>{cmpResult.conclusion}</p>
+            <div style={{ fontSize:9, fontFamily:"monospace", color:G.lime, textTransform:"uppercase", letterSpacing:".8px", marginBottom:6 }}>Conclusion</div>
+            {cmpResult.conclusion}
           </div>
         </>
       )}
-      {!cmpResult && !cmpLoading && <div style={{ fontSize:13, color:G.mist, padding:"20px 0" }}>Select companies above to compare.</div>}
+      {!cmpResult&&!cmpLoading&&<div style={{ fontSize:13, color:G.mist, padding:"20px 0" }}>Sélectionnez des entreprises ci-dessus pour les comparer.</div>}
     </div>
   );
 
-  // REPORTS
   const ReportsView = () => {
-    const withR = companies.filter(c=>c.report);
-    if (!withR.length) return <div style={{ fontSize:13, color:G.mist }}>No reports yet. Open a company and click "Gen. Report".</div>;
-    return (
+    const withR=companies.filter(c=>c.report);
+    if(!withR.length)return<div style={{ fontSize:13, color:G.mist }}>Aucun rapport. Ouvrez une fiche et cliquez "Générer rapport".</div>;
+    return(
       <div>
         {withR.map(c=>(
           <div key={c.id} style={{ background:G.ink2, border:`1px solid ${G.ink4}`, borderRadius:12, marginBottom:12, overflow:"hidden" }}>
             <div onClick={()=>setOpenReports(p=>({...p,[c.id]:!p[c.id]}))}
               style={{ padding:"13px 16px", display:"flex", alignItems:"center", gap:12, background:G.ink3, cursor:"pointer", borderBottom:`1px solid ${G.ink4}` }}>
-              <Avatar name={c.name} size={30} />
+              <Avatar name={c.name} size={30}/>
               <div style={{ flex:1 }}>
-                <div style={{ fontSize:13, fontWeight:700 }}>{c.name} — Investment Memo</div>
+                <div style={{ fontSize:13, fontWeight:700 }}>{c.name} — Mémo d'investissement</div>
                 <div style={{ fontSize:10, color:G.mist, fontFamily:"monospace" }}>{c.sector} · {c.stage} · {c.reportDate?new Date(c.reportDate).toLocaleDateString("fr-FR"):""}</div>
               </div>
-              <Tag text={c.status} color={c.status==="invested"?G.mint:c.status==="dead"?G.rose:G.sky} />
-              <Btn sm onClick={e=>{ e.stopPropagation(); exportWordBlob(c); showToast("Downloading .doc…"); }}>⬇ .doc</Btn>
-              <span style={{ color:G.mist, fontSize:13 }}>{openReports[c.id]?"▲":"▼"}</span>
+              <Tag text={c.status} color={c.status==="invested"?G.mint:c.status==="dead"?G.rose:G.sky}/>
+              <Btn sm accent onClick={e=>{e.stopPropagation();exportWord(c);showToast("Téléchargement…");}}>⬇ .doc</Btn>
+              <span style={{ color:G.mist }}>{openReports[c.id]?"▲":"▼"}</span>
             </div>
-            {openReports[c.id] && (
+            {openReports[c.id]&&(
               <div style={{ padding:16 }}>
                 <div style={{ fontSize:12.5, lineHeight:1.85, color:G.fog, whiteSpace:"pre-line" }}>{c.report}</div>
                 <div style={{ marginTop:14, display:"flex", gap:8 }}>
-                  <Btn onClick={()=>{ showToast("Refreshing report…"); genReport(c.id); }}>🔄 Refresh</Btn>
-                  <Btn accent onClick={()=>{ exportWordBlob(c); showToast("Downloading .doc…"); }}>⬇ Export Word</Btn>
+                  <Btn onClick={async()=>{showToast("Actualisation…");const r=await generateReportForCompany(c);if(r)mutate(c.id,{report:r,reportDate:new Date().toISOString()});renderReports();showToast("Rapport actualisé");}}>🔄 Actualiser</Btn>
+                  <Btn accent onClick={()=>{exportWord(c);showToast("Téléchargement…");}}>⬇ Exporter Word</Btn>
                 </div>
               </div>
             )}
@@ -1230,113 +1362,101 @@ Generate 6 strategic insights (mix hot opportunities + coverage gaps). Return JS
     );
   };
 
-  // OPPORTUNITIES
   const OppsView = () => (
     <div>
       <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:16 }}>
-        <span style={{ fontSize:12, color:G.mist }}>AI-powered analysis of portfolio coverage gaps and hot opportunities</span>
-        <Btn accent onClick={loadOpps}>{oppsLoading?<><Dots/> Analysing…</>:"✨ Refresh"}</Btn>
+        <span style={{ fontSize:12, color:G.mist }}>Analyse IA des opportunités et lacunes de votre portefeuille</span>
+        <Btn accent onClick={async()=>{
+          setOppsLoading(true);setOpps([]);
+          const sectors=[...new Set(companies.map(c=>c.sector))];
+          const r=await callClaudeJSON(`Portefeuille VC : ${companies.length} entreprises. Secteurs couverts : ${sectors.join(", ")||"aucun"}. Top entreprises : ${companies.filter(c=>c.scores?.overall>=7).map(c=>c.name).join(", ")||"aucun"}.\nGénère 6 insights stratégiques (mix opportunités chaudes + lacunes). Retourne tableau JSON : [{"type":"hot","icon":"🚀","title":"titre","description":"2 phrases"},{"type":"gap","icon":"⚠️","title":"lacune","description":"2 phrases"},...]`, "Stratège VC senior. Retourne UNIQUEMENT un tableau JSON valide.");
+          if(Array.isArray(r))setOpps(r);
+          setOppsLoading(false);
+        }} disabled={oppsLoading}>{oppsLoading?<><Dots/>Analyse…</>:"✨ Actualiser"}</Btn>
       </div>
+      {oppsLoading&&<div style={{ display:"flex", gap:8, alignItems:"center", color:G.mist, fontSize:13, marginBottom:14 }}><Dots/>Génération en cours…</div>}
       <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
         {opps.map((o,i)=>(
           <div key={i} style={{ background:G.ink2, border:`1px solid ${G.ink4}`, borderRadius:12, padding:16, display:"flex", gap:14 }}>
-            <div style={{ width:40, height:40, borderRadius:8, display:"flex", alignItems:"center", justifyContent:"center", fontSize:18, flexShrink:0,
-              background: o.type==="hot"?`${G.lime}12`:`${G.rose}12` }}>
-              {o.icon||"💡"}
-            </div>
+            <div style={{ width:40, height:40, borderRadius:8, display:"flex", alignItems:"center", justifyContent:"center", fontSize:18, flexShrink:0, background:o.type==="hot"?`${G.lime}12`:`${G.rose}12` }}>{o.icon||"💡"}</div>
             <div>
-              <div style={{ fontSize:9, fontFamily:"monospace", fontWeight:600, textTransform:"uppercase", letterSpacing:".8px", marginBottom:5,
-                padding:"2px 8px", borderRadius:20, display:"inline-block",
-                background: o.type==="hot"?`${G.lime}12`:`${G.rose}12`, color:o.type==="hot"?G.lime:G.rose }}>
-                {o.type==="hot"?"Hot Opportunity":"Coverage Gap"}
+              <div style={{ fontSize:9, fontFamily:"monospace", fontWeight:600, textTransform:"uppercase", letterSpacing:".8px", marginBottom:5, padding:"2px 8px", borderRadius:20, display:"inline-block", background:o.type==="hot"?`${G.lime}12`:`${G.rose}12`, color:o.type==="hot"?G.lime:G.rose }}>
+                {o.type==="hot"?"Opportunité chaude":"Lacune de couverture"}
               </div>
               <div style={{ fontSize:14, fontWeight:700, marginBottom:5 }}>{o.title}</div>
               <div style={{ fontSize:12, color:G.fog, lineHeight:1.7 }}>{o.description}</div>
             </div>
           </div>
         ))}
-        {!opps.length && !oppsLoading && <div style={{ fontSize:13, color:G.mist }}>Click "Refresh" to generate AI insights about your portfolio.</div>}
+        {!opps.length&&!oppsLoading&&<div style={{ fontSize:13, color:G.mist }}>Cliquez "Actualiser" pour générer les insights IA.</div>}
       </div>
     </div>
   );
 
-  // AI QUERY
-  const AIView = () => (
-    <div style={{ maxWidth:640 }}>
-      <div style={{ fontSize:12, color:G.mist, marginBottom:12, lineHeight:1.7 }}>
-        Ask anything about your portfolio. Data is sent with the <span style={{ color:G.lime }}>no-training</span> flag — not used to train AI models.
-      </div>
-      <textarea value={aiQuery} onChange={e=>setAiQuery(e.target.value)}
-        placeholder="e.g. Which companies have the best market opportunity? What's missing from my coverage? Compare team quality across Series A companies…"
-        style={{ background:G.ink3, border:`1px solid ${G.ink4}`, borderRadius:8, color:G.paper, fontSize:12, padding:"10px 12px", fontFamily:"inherit", width:"100%", minHeight:100, resize:"vertical", outline:"none", marginBottom:10 }} />
-      <Btn accent onClick={runAIQuery}>{aiLoading?<><Spinner/> Thinking…</>:"✨ Ask AI"}</Btn>
-      {aiAnswer && (
-        <div style={{ marginTop:16, background:G.ink3, border:`1px solid ${G.ink4}`, borderRadius:10, padding:16, fontSize:13, lineHeight:1.8, color:G.fog, whiteSpace:"pre-wrap" }}>
-          {aiAnswer}
-        </div>
-      )}
-    </div>
-  );
-
-  // ADD COMPANY
   const AddView = () => {
-    const f = addForm; const set = (k,v) => setAddForm(p=>({...p,[k]:v}));
-    const inp = (label, key, type="text") => (
-      <div>
-        <label style={{ fontSize:9, fontFamily:"monospace", textTransform:"uppercase", letterSpacing:".8px", color:G.mist, marginBottom:5, display:"block" }}>{label}</label>
-        <input type={type} value={f[key]} onChange={e=>set(key,e.target.value)}
-          style={{ background:G.ink3, border:`1px solid ${G.ink4}`, borderRadius:8, color:G.paper, fontSize:12, padding:"8px 12px", width:"100%", fontFamily:"inherit", outline:"none" }} />
-      </div>
-    );
+    const f=addForm; const set=(k,v)=>setAddForm(p=>({...p,[k]:v}));
     return (
-      <div style={{ maxWidth:560 }}>
-        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12, marginBottom:12 }}>
-          {inp("Company Name *","name")}
-          {inp("Website","url","url")}
-          <div>
-            <label style={{ fontSize:9, fontFamily:"monospace", textTransform:"uppercase", letterSpacing:".8px", color:G.mist, marginBottom:5, display:"block" }}>Sector</label>
-            <select value={f.sector} onChange={e=>set("sector",e.target.value)}
-              style={{ background:G.ink3, border:`1px solid ${G.ink4}`, borderRadius:8, color:G.paper, fontSize:12, padding:"8px 12px", width:"100%", fontFamily:"inherit", outline:"none" }}>
-              <option value="">Select…</option>{SECTORS.map(s=><option key={s}>{s}</option>)}
-            </select>
-          </div>
-          <div>
-            <label style={{ fontSize:9, fontFamily:"monospace", textTransform:"uppercase", letterSpacing:".8px", color:G.mist, marginBottom:5, display:"block" }}>Stage</label>
-            <select value={f.stage} onChange={e=>set("stage",e.target.value)}
-              style={{ background:G.ink3, border:`1px solid ${G.ink4}`, borderRadius:8, color:G.paper, fontSize:12, padding:"8px 12px", width:"100%", fontFamily:"inherit", outline:"none" }}>
-              {STAGES.map(s=><option key={s}>{s}</option>)}
-            </select>
-          </div>
-          {inp("Location","location")}
-          {inp("Founded","year")}
+      <div style={{ maxWidth:580 }}>
+        <div style={{ background:G.ink2, border:`1px solid ${G.ink4}`, borderRadius:12, padding:16, marginBottom:16 }}>
+          <div style={{ fontSize:13, fontWeight:700, marginBottom:8 }}>📁 Uploader des documents</div>
+          <div style={{ fontSize:12, color:G.mist, marginBottom:10 }}>L'IA extrait automatiquement toutes les informations du fichier.</div>
+          <DropZone onFiles={addWithFiles} />
+          {addLoading && <div style={{ display:"flex", gap:8, alignItems:"center", marginTop:10, fontSize:12, color:G.lime }}><Dots/> Extraction et analyse en cours…</div>}
         </div>
-        <div style={{ marginBottom:14 }}>
-          <label style={{ fontSize:9, fontFamily:"monospace", textTransform:"uppercase", letterSpacing:".8px", color:G.mist, marginBottom:5, display:"block" }}>Description / Pitch Content</label>
+        <div style={{ textAlign:"center", color:G.mist, fontSize:12, margin:"12px 0" }}>— ou saisir manuellement —</div>
+        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginBottom:10 }}>
+          <Input label="Nom *" value={f.name} onChange={v=>set("name",v)} />
+          <Input label="Site web" value={f.url} onChange={v=>set("url",v)} type="url" />
+          <Select label="Secteur" value={f.sector} onChange={v=>set("sector",v)} options={[{value:"",label:"Sélectionner…"},...SECTORS.map(s=>({value:s,label:s}))]} />
+          <Select label="Stade"   value={f.stage}  onChange={v=>set("stage",v)}  options={STAGES} />
+          <Input label="Localisation" value={f.location} onChange={v=>set("location",v)} />
+          <Input label="Fondée en"    value={f.year}     onChange={v=>set("year",v)} />
+        </div>
+        <div style={{ marginBottom:12 }}>
+          <label style={{ fontSize:9, fontFamily:"monospace", textTransform:"uppercase", letterSpacing:".8px", color:G.mist, marginBottom:5, display:"block" }}>Description / Contenu deck</label>
           <textarea value={f.description} onChange={e=>set("description",e.target.value)}
-            placeholder="Paste pitch deck text, description, or any info. AI will extract key insights."
+            placeholder="Collez du contenu de deck, description, ou toute info sur la startup…"
             style={{ background:G.ink3, border:`1px solid ${G.ink4}`, borderRadius:8, color:G.paper, fontSize:12, padding:"10px 12px", fontFamily:"inherit", width:"100%", minHeight:110, resize:"vertical", outline:"none" }} />
         </div>
         <div style={{ display:"flex", gap:8 }}>
-          <Btn accent onClick={addCompany} style={{ flex:1, justifyContent:"center" }}>✨ Assess with AI</Btn>
-          <Btn ghost onClick={()=>setAddForm({name:"",url:"",sector:"",stage:"Seed",location:"",year:"",description:""})}>✕</Btn>
+          <Btn accent onClick={addCompany} disabled={addLoading} style={{ flex:1, justifyContent:"center" }}>
+            {addLoading?<><Spin/>Analyse…</>:"✨ Analyser avec l'IA"}
+          </Btn>
+          <Btn ghost onClick={()=>setAddForm({ name:"",url:"",sector:"",stage:"Seed",location:"",year:"",description:"" })}>✕</Btn>
         </div>
       </div>
     );
   };
 
-  const viewMap = {
-    dashboard:   { comp:<DashView/>,    title:"Dashboard",      sub:"Portfolio overview" },
-    pipeline:    { comp:<PipelineView/>, title:"Pipeline",       sub:"Kanban deal flow" },
-    sectors:     { comp:<SectorsView/>,  title:"Sectors",         sub:"Coverage analysis" },
-    compare:     { comp:<CompareView/>,  title:"Compare",         sub:"Side-by-side AI analysis" },
-    reports:     { comp:<ReportsView/>,  title:"Reports",         sub:"Investment memos · Word export" },
-    opportunities:{ comp:<OppsView/>,    title:"Opportunities",   sub:"AI-powered insights" },
-    ai:          { comp:<AIView/>,       title:"AI Query",        sub:"Ask anything about your portfolio" },
-    email:       { comp:<EmailImportView onImport={importCompany} showToast={showToast}/>, title:"Email Import", sub:"Gmail · Roundcube · OVH · Outlook" },
-    add:         { comp:<AddView/>,      title:"Add Company",     sub:"Manual entry" },
+  const views = {
+    dashboard:    { comp:<DashView/>,     title:"Dashboard",           sub:"Vue d'ensemble du portefeuille" },
+    pipeline:     { comp:<PipelineView/>, title:"Pipeline",            sub:"Flux de deals Kanban" },
+    sectors:      { comp:<SectorsView/>,  title:"Secteurs",            sub:"Couverture sectorielle" },
+    compare:      { comp:<CompareView/>,  title:"Comparer",            sub:"Analyse comparative IA" },
+    reports:      { comp:<ReportsView/>,  title:"Rapports",            sub:"Mémos d'investissement · Export Word" },
+    opportunities:{ comp:<OppsView/>,     title:"Opportunités",        sub:"Insights IA sur le portefeuille" },
+    ai:           { comp:(
+      <div style={{ maxWidth:640 }}>
+        <div style={{ fontSize:12, color:G.mist, marginBottom:12, lineHeight:1.7 }}>
+          Posez n'importe quelle question sur votre portefeuille. Données traitées avec le flag <span style={{ color:G.lime }}>no-training</span>.
+        </div>
+        <textarea value={aiQ} onChange={e=>setAiQ(e.target.value)}
+          placeholder="Ex: Quelles entreprises ont la meilleure opportunité marché ? Que manque-t-il dans ma couverture FinTech ?"
+          style={{ background:G.ink3, border:`1px solid ${G.ink4}`, borderRadius:8, color:G.paper, fontSize:12, padding:"10px 12px", fontFamily:"inherit", width:"100%", minHeight:100, resize:"vertical", outline:"none", marginBottom:10 }} />
+        <Btn accent onClick={async()=>{
+          if(!aiQ.trim())return;setAiLoading(true);setAiA("");
+          const ctx=`Portefeuille : ${companies.length} entreprises. ${companies.map(c=>`${c.name}(${c.sector},${c.stage},${c.status},score:${c.scores?.overall||"?"})`).join("; ")}.`;
+          const ans=await callClaude(`Contexte portefeuille : ${ctx}\n\nQuestion : ${aiQ}`, "Tu es un associé VC senior. Donne des insights précis, spécifiques et actionnables.", {maxTokens:1200});
+          setAiA(ans);setAiLoading(false);
+        }} disabled={aiLoading}>{aiLoading?<><Spin/>Réflexion…</>:"✨ Interroger l'IA"}</Btn>
+        {aiA&&<div style={{ marginTop:16, background:G.ink3, border:`1px solid ${G.ink4}`, borderRadius:10, padding:16, fontSize:13, lineHeight:1.8, color:G.fog, whiteSpace:"pre-wrap" }}>{aiA}</div>}
+      </div>
+    ), title:"Requête IA", sub:"Interrogez votre portefeuille" },
+    email:        { comp:<EmailImportView onImport={importCompany} showToast={showToast}/>, title:"Import Email", sub:"Gmail · Roundcube · OVH · Coller" },
+    add:          { comp:<AddView/>,       title:"Ajouter",             sub:"Saisie manuelle ou upload de fichiers" },
   };
 
-  const current = viewMap[view] || viewMap.dashboard;
+  const current = views[view] || views.dashboard;
 
   return (
     <>
@@ -1344,80 +1464,77 @@ Generate 6 strategic insights (mix hot opportunities + coverage gaps). Return JS
         @keyframes spin  { to { transform:rotate(360deg); } }
         @keyframes blink { 0%,100%{opacity:.2} 50%{opacity:1} }
         * { box-sizing:border-box; margin:0; padding:0; -webkit-font-smoothing:antialiased; }
+        html,body,#root { height:100%; }
         ::-webkit-scrollbar { width:4px; height:4px; }
         ::-webkit-scrollbar-thumb { background:${G.ink4}; border-radius:2px; }
-        button:hover { filter:brightness(1.05); }
+        button { transition:filter .15s; }
+        button:hover:not(:disabled) { filter:brightness(1.08); }
       `}</style>
-
-      <div style={css.app}>
+      <div style={{ display:"flex", height:"100vh", overflow:"hidden", background:G.ink, color:G.paper, fontFamily:"system-ui,-apple-system,sans-serif" }}>
         {/* SIDEBAR */}
-        <nav style={css.side}>
+        <nav style={{ width:218, minWidth:218, background:G.ink2, borderRight:`1px solid ${G.ink4}`, display:"flex", flexDirection:"column", overflow:"hidden" }}>
           <div style={{ padding:"16px 12px 12px", borderBottom:`1px solid ${G.ink4}` }}>
-            <div style={{ display:"flex", alignItems:"center", gap:9, marginBottom:14 }}>
-              <div style={{ width:30, height:30, background:G.lime, borderRadius:8, display:"flex", alignItems:"center", justifyContent:"center", fontSize:14 }}>⬡</div>
+            <div style={{ display:"flex", alignItems:"center", gap:9, marginBottom:10 }}>
+              <div style={{ width:30, height:30, background:G.lime, borderRadius:8, display:"flex", alignItems:"center", justifyContent:"center", fontSize:15 }}>⬡</div>
               <div>
                 <div style={{ fontSize:13, fontWeight:800, letterSpacing:"-.2px" }}>Dealflow OS</div>
-                <div style={{ fontSize:9, color:G.mist, fontFamily:"monospace", letterSpacing:"1px" }}>AI · VC PLATFORM</div>
+                <div style={{ fontSize:9, color:G.mist, fontFamily:"monospace", letterSpacing:"1px" }}>VC · AI PLATFORM</div>
               </div>
             </div>
-            <div style={{ display:"flex", gap:4 }}>
-              <div style={{ background:G.ink3, border:`1px solid ${G.lime}33`, borderRadius:6, padding:"4px 8px", fontSize:9, color:G.lime, fontFamily:"monospace" }}>🔒 no-training</div>
-            </div>
+            <div style={{ background:G.ink3, border:`1px solid ${G.lime}33`, borderRadius:6, padding:"4px 8px", fontSize:9, color:G.lime, fontFamily:"monospace", display:"inline-block" }}>🔒 no-training</div>
           </div>
           <div style={{ flex:1, overflowY:"auto", padding:"10px 8px" }}>
-            <div style={{ fontSize:9, fontFamily:"monospace", textTransform:"uppercase", letterSpacing:"1.5px", color:G.mist, padding:"4px 10px 8px" }}>Portfolio</div>
-            <NavItem icon="⬢"  label="Dashboard"     badge={total}           active={view==="dashboard"}    onClick={()=>setView("dashboard")} />
-            <NavItem icon="⬡"  label="Pipeline"       badge={counts.dealflow} active={view==="pipeline"}     onClick={()=>setView("pipeline")} />
-            <NavItem icon="🥧" label="Sectors"                                active={view==="sectors"}      onClick={()=>setView("sectors")} />
-            <div style={{ height:1, background:G.ink4, margin:"8px 4px" }} />
-            <div style={{ fontSize:9, fontFamily:"monospace", textTransform:"uppercase", letterSpacing:"1.5px", color:G.mist, padding:"4px 10px 8px" }}>Intelligence</div>
-            <NavItem icon="⇄"  label="Compare"                                active={view==="compare"}      onClick={()=>setView("compare")} />
-            <NavItem icon="📄" label="Reports"         badge={companies.filter(c=>c.report).length} active={view==="reports"} onClick={()=>setView("reports")} />
-            <NavItem icon="💡" label="Opportunities"                           active={view==="opportunities"} onClick={()=>setView("opportunities")} />
-            <NavItem icon="✨" label="AI Query"                                active={view==="ai"}           onClick={()=>setView("ai")} />
-            <div style={{ height:1, background:G.ink4, margin:"8px 4px" }} />
-            <div style={{ fontSize:9, fontFamily:"monospace", textTransform:"uppercase", letterSpacing:"1.5px", color:G.mist, padding:"4px 10px 8px" }}>Ingest</div>
-            <NavItem icon="📧" label="Email Import"                            active={view==="email"}        onClick={()=>setView("email")} />
-            <NavItem icon="✚"  label="Add Manually"                            active={view==="add"}          onClick={()=>setView("add")} />
+            {[
+              ["Portfolio",""],
+              ["dashboard","⬢","Dashboard",companies.length],
+              ["pipeline","⬡","Pipeline",counts.dealflow],
+              ["sectors","🥧","Secteurs",null],
+              ["Intelligence",""],
+              ["compare","⇄","Comparer",null],
+              ["reports","📄","Rapports",companies.filter(c=>c.report).length],
+              ["opportunities","💡","Opportunités",null],
+              ["ai","✨","Requête IA",null],
+              ["Données",""],
+              ["email","📧","Import Email",null],
+              ["add","✚","Ajouter",null],
+            ].map((item,i)=>{
+              if(item.length===1) return <div key={i} style={{ fontSize:9, fontFamily:"monospace", textTransform:"uppercase", letterSpacing:"1.5px", color:G.mist, padding:"4px 10px 8px", marginTop:i>0?8:0 }}>{item[0]}</div>;
+              const [id,icon,label,badge]=item;
+              return <NavItem key={id} icon={icon} label={label} badge={badge} active={view===id} onClick={()=>setView(id)} />;
+            })}
           </div>
           <div style={{ padding:"10px 8px", borderTop:`1px solid ${G.ink4}` }}>
-            <NavItem icon="🗄" label="Load Demo" onClick={loadDemo} />
+            <NavItem icon="🗄" label="Démo" onClick={loadDemo} />
           </div>
         </nav>
 
         {/* MAIN */}
-        <div style={css.main}>
-          <div style={css.topbar}>
+        <div style={{ flex:1, display:"flex", flexDirection:"column", overflow:"hidden" }}>
+          <div style={{ height:52, minHeight:52, background:G.ink2, borderBottom:`1px solid ${G.ink4}`, display:"flex", alignItems:"center", padding:"0 20px", gap:12 }}>
             <div>
               <div style={{ fontSize:15, fontWeight:700 }}>{current.title}</div>
               <div style={{ fontSize:10, color:G.mist, fontFamily:"monospace" }}>{current.sub}</div>
             </div>
             <div style={{ marginLeft:"auto", display:"flex", gap:8 }}>
               <Btn ghost onClick={()=>setView("email")}>📧 Import email</Btn>
-              <Btn onClick={()=>setView("add")}>✚ Add company</Btn>
-              <Btn accent onClick={()=>setView("ai")}>✨ AI Query</Btn>
+              <Btn onClick={()=>setView("add")}>✚ Ajouter</Btn>
+              <Btn accent onClick={()=>setView("ai")}>✨ IA</Btn>
             </div>
           </div>
-          <div style={css.scroll}>{current.comp}</div>
+          <div style={{ flex:1, overflowY:"auto", padding:20 }}>{current.comp}</div>
         </div>
 
-        {/* PANEL */}
+        {/* DETAIL PANEL */}
         {panel && (
           <>
-            <div onClick={()=>setPanelId(null)}
-              style={{ position:"fixed", inset:0, background:"rgba(0,0,0,.55)", zIndex:90, backdropFilter:"blur(2px)" }} />
-            <DetailPanel
-              company={panel}
-              onClose={()=>setPanelId(null)}
-              onStatusChange={s=>mutate(panelId,{status:s})}
-              onRefresh={handleRefresh}
-              onExport={()=>{ exportWordBlob(panel); showToast("Downloading .doc…"); }}
-              onNote={text=>{ mutate(panelId,{ notes:[{text,date:new Date().toISOString()},...(panel.notes||[])] }); showToast("Note saved"); }}
-            />
+            <div onClick={()=>setPanelId(null)} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,.55)", zIndex:190, backdropFilter:"blur(2px)" }} />
+            <DetailPanel company={panel} onClose={()=>setPanelId(null)}
+              onChange={patch=>mutate(panelId,patch)}
+              onAction={handleAction} />
           </>
         )}
 
-        <Toast msg={toastMsg} visible={toastVis} />
+        <Toast msg={toast.msg} visible={toast.visible} />
       </div>
     </>
   );
