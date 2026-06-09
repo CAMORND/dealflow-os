@@ -1,7 +1,7 @@
 /**
- * api.js — All Claude API calls go through /api/claude (Vercel proxy).
- * Never calls Anthropic directly from the browser (CORS fix).
- * Adds no-training flag server-side.
+ * api.js — client-side API module.
+ * All Claude calls go through /api/claude (Vercel serverless proxy).
+ * Never calls Anthropic directly — avoids CORS and key exposure.
  */
 
 const PROXY = "/api/claude";
@@ -12,70 +12,90 @@ async function post(payload) {
     headers: { "Content-Type": "application/json" },
     body:    JSON.stringify(payload),
   });
+
+  // Surface API errors clearly
   if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.error || `API error ${res.status}`);
+    let msg = `API error ${res.status}`;
+    try { const e = await res.json(); msg = e.error || msg; } catch {}
+    throw new Error(msg);
   }
-  return res.json();
+
+  const data = await res.json();
+
+  // Propagate Anthropic-level errors (wrong key, overloaded, etc.)
+  if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
+  return data;
 }
 
-/** Extract all text blocks from an Anthropic response */
-function text(data) {
+/** Extract text content from an Anthropic response */
+function extractText(data) {
   return (data.content || [])
-    .filter((b) => b.type === "text")
-    .map((b) => b.text)
+    .filter(b => b.type === "text")
+    .map(b => b.text)
     .join("");
 }
 
-/** Call Claude, get raw text back */
+/** Call Claude → returns raw text string */
 export async function callClaude(prompt, system, opts = {}) {
   const data = await post({
     system,
-    max_tokens:  opts.maxTokens || 1200,
-    use_gmail:   opts.useGmail  || false,
-    messages:    [{ role: "user", content: prompt }],
+    max_tokens: opts.maxTokens || 1200,
+    use_gmail:  opts.useGmail  || false,
+    messages:   [{ role: "user", content: prompt }],
   });
-  return text(data);
+  return extractText(data);
 }
 
-/** Call Claude, parse JSON response (strips markdown fences) */
+/** Call Claude → parses and returns JSON (strips markdown fences) */
 export async function callClaudeJSON(prompt, system, opts = {}) {
   const raw = await callClaude(
     prompt,
-    (system || "") + "\nReturn ONLY valid JSON — no markdown fences, no prose.",
+    (system || "") + "\nRespond with ONLY valid JSON — no markdown fences, no explanation.",
     opts
   );
+  const cleaned = raw.replace(/^```(?:json)?|```$/gm, "").trim();
   try {
-    return JSON.parse(raw.replace(/```json|```/g, "").trim());
+    return JSON.parse(cleaned);
   } catch {
-    console.error("JSON parse failed:", raw.slice(0, 200));
+    // Try to find a JSON object/array in the response
+    const match = cleaned.match(/(\{[\s\S]*\}|\[[\s\S]*\])/);
+    if (match) {
+      try { return JSON.parse(match[1]); } catch {}
+    }
+    console.error("JSON parse failed. Raw response:", raw.slice(0, 300));
     return null;
   }
 }
 
-/** Load Gmail emails via MCP (server-side only) */
+/** Load Gmail emails via MCP (executed server-side in the proxy) */
 export async function loadGmailEmails() {
   const data = await post({
     use_gmail:  true,
     max_tokens: 2000,
-    system:     "You are a Gmail assistant. Fetch emails and return structured JSON only.",
+    system:     "You are a Gmail assistant. Use Gmail tools to fetch emails. Return structured JSON only — no markdown.",
     messages: [{
       role:    "user",
-      content: `Fetch the 20 most recent emails from Gmail. 
-For each email return a JSON object with these exact fields:
-id, fromName, fromEmail, subject, date (ISO 8601), bodySnippet (first 300 chars of body), 
-hasAttachments (boolean), attachments (array of {name, mimeType, size}).
-Return a JSON array only — no prose, no markdown.`,
+      content: `Fetch the 20 most recent emails from Gmail.
+Return a JSON array where each item has:
+id, fromName, fromEmail, subject, date (ISO 8601), bodySnippet (first 300 chars),
+hasAttachments (boolean), attachments (array of {name, size}).
+Return ONLY the JSON array.`,
     }],
   });
 
-  const raw = text(data).replace(/```json|```/g, "").trim();
-  const parsed = JSON.parse(raw);
-  return Array.isArray(parsed) ? parsed : [];
+  const raw = extractText(data).replace(/^```(?:json)?|```$/gm, "").trim();
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    // If Claude returned prose instead of JSON, return empty so the UI falls back to demo
+    console.warn("Gmail MCP returned non-JSON:", raw.slice(0, 200));
+    return [];
+  }
 }
 
-/** Read a file and return base64 + mimeType for Claude vision */
-export function readFileAsBase64(file) {
+/** Read a file as base64 data URL, return only the base64 part */
+function readFileAsBase64(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload  = () => resolve(reader.result.split(",")[1]);
@@ -84,79 +104,97 @@ export function readFileAsBase64(file) {
   });
 }
 
-/** Extract text from a file using Claude vision/document API */
-export async function extractFileContent(file) {
-  const MAX_TEXT = 5 * 1024 * 1024; // 5 MB text files read directly
-  const ext = file.name.split(".").pop().toLowerCase();
-  const textTypes = ["txt", "md", "csv", "json", "xml", "html", "eml"];
+/** Read a file as plain text */
+function readFileAsText(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload  = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsText(file);
+  });
+}
 
-  if (textTypes.includes(ext) && file.size < MAX_TEXT) {
-    return new Promise((resolve, reject) => {
-      const r = new FileReader();
-      r.onload  = () => resolve({ type: "text", content: r.result });
-      r.onerror = reject;
-      r.readAsText(file);
-    });
+const TEXT_TYPES = new Set(["txt", "md", "csv", "json", "xml", "html", "htm", "eml", "rtf"]);
+const IMAGE_TYPES = new Set(["jpg", "jpeg", "png", "gif", "webp"]);
+const MIME_MAP = {
+  pdf:  "application/pdf",
+  jpg:  "image/jpeg", jpeg: "image/jpeg",
+  png:  "image/png",  gif: "image/gif", webp: "image/webp",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  doc:  "application/msword",
+  pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  ppt:  "application/vnd.ms-powerpoint",
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  xls:  "application/vnd.ms-excel",
+  txt:  "text/plain", csv: "text/csv",
+};
+
+/**
+ * Extract text content from any supported file type.
+ * Returns { type: "text", content: string }
+ */
+export async function extractFileContent(file) {
+  const ext      = file.name.split(".").pop().toLowerCase();
+  const mimeType = file.type || MIME_MAP[ext] || "application/octet-stream";
+
+  // Plain text files — read directly, no API call needed
+  if (TEXT_TYPES.has(ext) && file.size < 2 * 1024 * 1024) {
+    const content = await readFileAsText(file);
+    return { type: "text", content };
   }
 
-  // For binary files (PDF, DOCX, PPTX, XLS, images) — send to Claude as base64
-  const b64      = await readFileAsBase64(file);
-  const mimeType = file.type || guessMime(ext);
+  const b64 = await readFileAsBase64(file);
 
-  // Images: use vision
-  if (["jpg","jpeg","png","gif","webp"].includes(ext)) {
+  // Images — Claude vision
+  if (IMAGE_TYPES.has(ext)) {
     const data = await post({
       max_tokens: 1000,
-      system:     "Extract all text and key information visible in this image. Be thorough.",
+      system:     "Extract all visible text and key information from this image thoroughly.",
       messages: [{
         role:    "user",
         content: [
           { type: "image", source: { type: "base64", media_type: mimeType, data: b64 } },
-          { type: "text",  text:   "Extract all text and structured information from this image." },
+          { type: "text",  text:   "Extract all text, numbers, tables and key data visible in this image." },
         ],
       }],
     });
-    return { type: "text", content: text(data) };
+    return { type: "text", content: extractText(data) };
   }
 
-  // PDFs: use document API
+  // PDFs — Claude document API
   if (ext === "pdf") {
     const data = await post({
       max_tokens: 2000,
-      system:     "Extract all text content from this PDF. Preserve structure.",
+      system:     "Extract all text and structured information from this PDF document.",
       messages: [{
         role:    "user",
         content: [
           { type: "document", source: { type: "base64", media_type: "application/pdf", data: b64 } },
-          { type: "text",     text:   "Extract all text, numbers, and key information from this document." },
+          { type: "text",     text:   "Extract all text, numbers, tables and key information." },
         ],
       }],
     });
-    return { type: "text", content: text(data) };
+    return { type: "text", content: extractText(data) };
   }
 
-  // DOCX / PPTX / XLS — ask Claude to interpret base64 with context
+  // DOCX / PPTX / XLSX — describe the file and ask Claude to extract from structure
+  // We cannot send raw binary base64 as a text prompt; instead we instruct Claude
+  // to extract what it can from the metadata + ask the user to paste key content.
+  // For proper Office parsing, a server-side library (mammoth, xlsx) would be needed.
   const data = await post({
-    max_tokens: 1500,
-    system:     "You receive a base64-encoded office document. Extract its key content as plain text.",
+    max_tokens: 800,
+    system:     "You help extract information from office documents.",
     messages: [{
       role:    "user",
-      content: `This is a ${ext.toUpperCase()} file named "${file.name}" encoded in base64. 
-Extract all readable text, tables, and key data from it. 
-Base64 data: ${b64.slice(0, 50000)}`,  // Claude context limit safety
+      content: `The user uploaded a ${ext.toUpperCase()} file named "${file.name}" (${(file.size/1024).toFixed(0)} KB).
+Since binary Office files cannot be decoded from base64 in this context, please acknowledge the file
+and ask the user to paste the key content (text from slides, financial data, etc.) so you can analyse it.
+Respond in French.`,
     }],
   });
-  return { type: "text", content: text(data) };
-}
-
-function guessMime(ext) {
-  const map = {
-    pdf: "application/pdf", jpg: "image/jpeg", jpeg: "image/jpeg",
-    png: "image/png", gif: "image/gif", webp: "image/webp",
-    docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    txt: "text/plain", csv: "text/csv", eml: "message/rfc822",
+  return {
+    type:    "text",
+    content: extractText(data) + `\n\n[Fichier : ${file.name} — collez le contenu textuel ci-dessous pour une analyse complète]`,
+    needsPaste: true,
   };
-  return map[ext] || "application/octet-stream";
 }
