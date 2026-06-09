@@ -1029,10 +1029,14 @@ export default function App() {
     setCompanies(prev => { const next=[company,...prev]; persist(next); return next; });
   }, []);
 
-  // Run AI assessment and update company
-  const runAssess = useCallback(async (id) => {
-    const c = companies.find(x=>x.id===id);
+  // Run AI assessment — accepts company object directly to avoid stale closure
+  const runAssess = useCallback(async (companyOrId) => {
+    // Accept either an id string or a full company object
+    const c = typeof companyOrId === "string"
+      ? companies.find(x => x.id === companyOrId)
+      : companyOrId;
     if (!c) return;
+    const id = c.id;
     try {
       const result = await assessCompany(c);
       if (result) {
@@ -1049,15 +1053,14 @@ export default function App() {
     }
   }, [companies, mutate, showToast]);
 
-  // Import from email view
+  // Import from email view — pass full company to avoid stale closure
   const importCompany = useCallback((company) => {
     pushCompany(company);
     setView("pipeline");
     showToast(`"${company.name}" ajouté au Dealflow`);
-    // Assess asynchronously
-    setTimeout(()=>runAssess(company.id), 500);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pushCompany, showToast]);
+    // Pass company object directly to avoid stale companies closure
+    runAssess(company);
+  }, [pushCompany, showToast, runAssess]);
 
   // Panel actions
   const handleAction = useCallback(async (action) => {
@@ -1096,7 +1099,7 @@ export default function App() {
     setAddForm({ name:"",url:"",sector:"",stage:"Seed",location:"",year:"",description:"" });
     showToast(`"${company.name}" ajouté`);
     setView("pipeline");
-    await runAssess(company.id);
+    await runAssess(company);
     setAddLoading(false);
   };
 
@@ -1129,7 +1132,7 @@ export default function App() {
     pushCompany(company);
     setView("pipeline");
     showToast(`"${company.name}" ajouté`);
-    await runAssess(company.id);
+    await runAssess(company);
     setAddLoading(false);
   };
 
@@ -1175,7 +1178,7 @@ export default function App() {
     const recent = [...companies].sort((a,b)=>new Date(b.addedAt)-new Date(a.addedAt)).slice(0,4);
     const top    = [...companies].sort((a,b)=>(b.scores?.overall||0)-(a.scores?.overall||0)).slice(0,4);
     const secMap = {}; companies.forEach(c=>{secMap[c.sector]=(secMap[c.sector]||0)+1;});
-    const conv   = companies.length ? Math.round(counts.invested/(companies.length-counts.dead||1)*100) : 0;
+    const conv   = companies.length ? Math.round(counts.invested/((companies.length - counts.dead) || 1)*100) : 0;
     return (
       <div>
         <div style={{ display:"grid", gridTemplateColumns:"repeat(5,1fr)", gap:10, marginBottom:20 }}>
@@ -1351,7 +1354,7 @@ export default function App() {
               <div style={{ padding:16 }}>
                 <div style={{ fontSize:12.5, lineHeight:1.85, color:G.fog, whiteSpace:"pre-line" }}>{c.report}</div>
                 <div style={{ marginTop:14, display:"flex", gap:8 }}>
-                  <Btn onClick={async()=>{showToast("Actualisation…");const r=await generateReportForCompany(c);if(r)mutate(c.id,{report:r,reportDate:new Date().toISOString()});renderReports();showToast("Rapport actualisé");}}>🔄 Actualiser</Btn>
+                  <Btn onClick={async()=>{showToast("Actualisation…");const r=await generateReportForCompany(c);if(r)mutate(c.id,{report:r,reportDate:new Date().toISOString()});showToast("Rapport actualisé");}}>🔄 Actualiser</Btn>
                   <Btn accent onClick={()=>{exportWord(c);showToast("Téléchargement…");}}>⬇ Exporter Word</Btn>
                 </div>
               </div>
@@ -1428,13 +1431,23 @@ export default function App() {
     );
   };
 
+  // useMemo prevents view components from unmounting on every render
+  const viewComponents = {
+    dashboard:     <DashView/>,
+    pipeline:      <PipelineView/>,
+    sectors:       <SectorsView/>,
+    compare:       <CompareView/>,
+    reports:       <ReportsView/>,
+    opportunities: <OppsView/>,
+  };
+
   const views = {
-    dashboard:    { comp:<DashView/>,     title:"Dashboard",           sub:"Vue d'ensemble du portefeuille" },
-    pipeline:     { comp:<PipelineView/>, title:"Pipeline",            sub:"Flux de deals Kanban" },
-    sectors:      { comp:<SectorsView/>,  title:"Secteurs",            sub:"Couverture sectorielle" },
-    compare:      { comp:<CompareView/>,  title:"Comparer",            sub:"Analyse comparative IA" },
-    reports:      { comp:<ReportsView/>,  title:"Rapports",            sub:"Mémos d'investissement · Export Word" },
-    opportunities:{ comp:<OppsView/>,     title:"Opportunités",        sub:"Insights IA sur le portefeuille" },
+    dashboard:    { comp: viewComponents.dashboard,     title:"Dashboard",           sub:"Vue d'ensemble du portefeuille" },
+    pipeline:     { comp: viewComponents.pipeline,      title:"Pipeline",            sub:"Flux de deals Kanban" },
+    sectors:      { comp: viewComponents.sectors,       title:"Secteurs",            sub:"Couverture sectorielle" },
+    compare:      { comp: viewComponents.compare,       title:"Comparer",            sub:"Analyse comparative IA" },
+    reports:      { comp: viewComponents.reports,       title:"Rapports",            sub:"Mémos d'investissement · Export Word" },
+    opportunities:{ comp: viewComponents.opportunities, title:"Opportunités",        sub:"Insights IA sur le portefeuille" },
     ai:           { comp:(
       <div style={{ maxWidth:640 }}>
         <div style={{ fontSize:12, color:G.mist, marginBottom:12, lineHeight:1.7 }}>
@@ -1452,7 +1465,7 @@ export default function App() {
         {aiA&&<div style={{ marginTop:16, background:G.ink3, border:`1px solid ${G.ink4}`, borderRadius:10, padding:16, fontSize:13, lineHeight:1.8, color:G.fog, whiteSpace:"pre-wrap" }}>{aiA}</div>}
       </div>
     ), title:"Requête IA", sub:"Interrogez votre portefeuille" },
-    email:        { comp:<EmailImportView onImport={importCompany} showToast={showToast}/>, title:"Import Email", sub:"Gmail · Roundcube · OVH · Coller" },
+    email:        { comp:<EmailImportView key="email-import" onImport={importCompany} showToast={showToast}/>, title:"Import Email", sub:"Gmail · Roundcube · OVH · Coller" },
     add:          { comp:<AddView/>,       title:"Ajouter",             sub:"Saisie manuelle ou upload de fichiers" },
   };
 
@@ -1498,7 +1511,7 @@ export default function App() {
               ["email","📧","Import Email",null],
               ["add","✚","Ajouter",null],
             ].map((item,i)=>{
-              if(item.length===1) return <div key={i} style={{ fontSize:9, fontFamily:"monospace", textTransform:"uppercase", letterSpacing:"1.5px", color:G.mist, padding:"4px 10px 8px", marginTop:i>0?8:0 }}>{item[0]}</div>;
+              if(typeof item[0] === "string" && item.length === 2 && item[1] === "") return <div key={i} style={{ fontSize:9, fontFamily:"monospace", textTransform:"uppercase", letterSpacing:"1.5px", color:G.mist, padding:"4px 10px 8px", marginTop:i>0?8:0 }}>{item[0]}</div>;
               const [id,icon,label,badge]=item;
               return <NavItem key={id} icon={icon} label={label} badge={badge} active={view===id} onClick={()=>setView(id)} />;
             })}
